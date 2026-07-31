@@ -1,10 +1,19 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
 import { BuzzIcon } from "./BuzzIcon";
 
 describe("BuzzIcon", () => {
-  it("renders the 24px Buzz line mark as a current-color mask", () => {
+  it("preserves the exact approved Buzz asset bytes", () => {
+    const asset = readFileSync(new URL("../assets/BuzzLogo24px.svg", import.meta.url));
+    expect(createHash("sha256").update(asset).digest("hex")).toBe(
+      "6efb8bf616e0febd3940f411927d42cccddfd798112c9fc53e3f7b9ae46f4ce0",
+    );
+  });
+
+  it("renders the approved 24px Buzz mark as a current-color mask", () => {
     const markup = renderToStaticMarkup(<BuzzIcon className="test-icon" />);
 
     expect(markup).toContain("<span");

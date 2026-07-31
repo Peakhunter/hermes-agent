@@ -1973,6 +1973,8 @@ DEFAULT_CONFIG = {
     # because the plugin adapter consumes PlatformConfig.extra.
     "buzz": {
         "extra": {
+            "allowed_users": [],           # Public Nostr npubs or hex pubkeys
+            "allow_all_users": False,      # Secure default: deny unlisted senders
             "require_mention": True,        # Require @mention in shared channels
             "thread_require_mention": True,  # Preserve strict historical behavior by default
         },
@@ -2550,6 +2552,20 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        # Platform plugin settings use the canonical gateway.platforms path.
+        # Schema overrides render these Buzz fields as their own Dashboard
+        # section rather than burying them under general gateway controls.
+        "platforms": {
+            "buzz": {
+                "extra": {
+                    # Public Nostr npubs or hex pubkeys allowed to instruct this agent.
+                    "allowed_users": [],
+                    # Secure default: do not admit every community member implicitly.
+                    "allow_all_users": False,
+                },
+            },
+        },
+
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
         # died between finalize and platform ACK redelivers the stored

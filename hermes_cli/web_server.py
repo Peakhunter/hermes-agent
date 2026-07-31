@@ -853,10 +853,26 @@ def _timezone_options() -> List[str]:
 
 _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "buzz.extra.require_mention": {
+        "category": "buzz",
         "description": "Require Mention",
     },
     "buzz.extra.thread_require_mention": {
+        "category": "buzz",
         "description": "Require Mention in Active Threads",
+    },
+    "gateway.platforms.buzz.extra.allowed_users": {
+        "category": "buzz",
+        "description": (
+            "Public Nostr npubs or hex pubkeys allowed to send inbound "
+            "instructions to this Hermes agent"
+        ),
+    },
+    "gateway.platforms.buzz.extra.allow_all_users": {
+        "category": "buzz",
+        "description": (
+            "Allow any Buzz community member to send inbound instructions "
+            "to this Hermes agent"
+        ),
     },
     "timezone": {
         "type": "select",
@@ -6882,6 +6898,29 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
+def _validate_buzz_allowed_users(config: Dict[str, Any]) -> None:
+    """Reject malformed Buzz identities before persisting Dashboard config."""
+    current: Any = config
+    for key in ("gateway", "platforms", "buzz", "extra", "allowed_users"):
+        if not isinstance(current, dict) or key not in current:
+            return
+        current = current[key]
+    if not isinstance(current, list):
+        raise HTTPException(status_code=422, detail="Buzz Allowed Users must be a list")
+
+    from plugins.platforms.buzz.adapter import normalize_user_ref
+
+    for index, value in enumerate(current, start=1):
+        if not isinstance(value, str) or normalize_user_ref(value) is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Invalid Buzz public key at Allowed Users item {index}; "
+                    "use one npub or 64-character hex public key per item"
+                ),
+            )
+
+
 @app.put("/api/config")
 async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
     try:
@@ -6894,6 +6933,7 @@ async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
             # frontend can only overwrite what it explicitly sends.
             existing = read_raw_config()
             incoming = _denormalize_config_from_web(body.config)
+            _validate_buzz_allowed_users(incoming)
             save_config(_deep_merge(existing, incoming))
         return {"ok": True}
     except HTTPException:

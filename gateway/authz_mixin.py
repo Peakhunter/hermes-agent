@@ -523,7 +523,9 @@ class GatewayAuthorizationMixin:
             Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
         }
 
-        # Plugin platforms: check the registry for auth env var names
+        # Plugin platforms: check the registry for auth env var names and any
+        # platform-specific identity canonicalizer (e.g. Buzz npub -> hex).
+        auth_identity_normalizer = None
         if source.platform not in platform_env_map:
             try:
                 from gateway.platform_registry import platform_registry
@@ -533,6 +535,7 @@ class GatewayAuthorizationMixin:
                         platform_env_map[source.platform] = entry.allowed_users_env
                     if entry.allow_all_env:
                         platform_allow_all_map[source.platform] = entry.allow_all_env
+                    auth_identity_normalizer = entry.auth_identity_normalizer
             except Exception:
                 pass
 
@@ -687,7 +690,23 @@ class GatewayAuthorizationMixin:
         # allowlist and still works everywhere for backward compatibility.
         allowed_ids = set()
         if platform_allowlist:
-            allowed_ids.update(uid.strip() for uid in platform_allowlist.split(",") if uid.strip())
+            platform_allowed_ids = {
+                uid.strip() for uid in platform_allowlist.split(",") if uid.strip()
+            }
+            if auth_identity_normalizer:
+                normalized_platform_ids = set()
+                for allowed_id in platform_allowed_ids:
+                    if allowed_id == "*":
+                        normalized_platform_ids.add(allowed_id)
+                        continue
+                    try:
+                        normalized = auth_identity_normalizer(allowed_id)
+                    except Exception:
+                        normalized = None
+                    if normalized:
+                        normalized_platform_ids.add(normalized)
+                platform_allowed_ids = normalized_platform_ids
+            allowed_ids.update(platform_allowed_ids)
         if group_user_allowlist:
             allowed_ids.update(uid.strip() for uid in group_user_allowlist.split(",") if uid.strip())
         if global_allowlist:
@@ -699,6 +718,13 @@ class GatewayAuthorizationMixin:
             return True
 
         check_ids = {user_id}
+        if auth_identity_normalizer:
+            try:
+                normalized_user_id = auth_identity_normalizer(user_id)
+            except Exception:
+                normalized_user_id = None
+            if normalized_user_id:
+                check_ids.add(normalized_user_id)
         if "@" in user_id:
             check_ids.add(user_id.split("@")[0])
 

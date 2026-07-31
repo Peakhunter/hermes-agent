@@ -1,7 +1,11 @@
+import { useEffect, useRef, useState } from "react";
+
 import { Select, SelectOption } from "@nous-research/ui/ui/components/select";
 import { Switch } from "@nous-research/ui/ui/components/switch";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { Label } from "@nous-research/ui/ui/components/label";
+
+import { updateListInputDraft } from "./autoFieldListInput";
 
 function FieldHint({ schema, schemaKey }: { schema: Record<string, unknown>; schemaKey: string }) {
   const keyPath = schemaKey.includes(".") ? schemaKey : "";
@@ -26,6 +30,50 @@ function formatScalar(value: unknown): string {
   if (typeof value === "string") return value;
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   return JSON.stringify(value);
+}
+
+function formatListValue(value: unknown): string {
+  return Array.isArray(value) ? value.join(", ") : String(value ?? "");
+}
+
+function ListFieldInput({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: unknown;
+  onChange: (v: unknown) => void;
+}) {
+  const externalValue = formatListValue(value);
+  const [draft, setDraft] = useState(externalValue);
+  const editing = useRef(false);
+
+  useEffect(() => {
+    if (!editing.current) {
+      // External config/profile changes should replace an idle draft.
+      setDraft(externalValue);
+    }
+  }, [externalValue]);
+
+  return (
+    <Input
+      aria-label={label}
+      value={draft}
+      onFocus={() => {
+        editing.current = true;
+      }}
+      onBlur={() => {
+        editing.current = false;
+      }}
+      onChange={(e) => {
+        const update = updateListInputDraft(e.target.value);
+        setDraft(update.draft);
+        onChange(update.value);
+      }}
+      placeholder="comma-separated values"
+    />
+  );
 }
 
 function NestedValueEditor({
@@ -108,7 +156,11 @@ export function AutoField({
           <Label className="text-sm">{label}</Label>
           <FieldHint schema={schema} schemaKey={schemaKey} />
         </div>
-        <Switch checked={!!value} onCheckedChange={onChange} />
+        <Switch
+          aria-label={label}
+          checked={!!value}
+          onCheckedChange={onChange}
+        />
       </div>
     );
   }
@@ -173,18 +225,7 @@ export function AutoField({
       <div className="grid gap-1.5">
         <Label className="text-sm">{label}</Label>
         <FieldHint schema={schema} schemaKey={schemaKey} />
-        <Input
-          value={Array.isArray(value) ? value.join(", ") : String(value ?? "")}
-          onChange={(e) =>
-            onChange(
-              e.target.value
-                .split(",")
-                .map((s) => s.trim())
-                .filter(Boolean),
-            )
-          }
-          placeholder="comma-separated values"
-        />
+        <ListFieldInput label={label} value={value} onChange={onChange} />
       </div>
     );
   }

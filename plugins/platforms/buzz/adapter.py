@@ -24,7 +24,8 @@ Configuration in config.yaml::
             poll_interval: 4           # seconds between poll sweeps
             cli_path: ""               # path to the buzz binary (default: PATH, then ~/bin/buzz)
             credentials_file: ""       # JSON file holding the nsec (fallback for BUZZ_PRIVATE_KEY)
-            allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
+            allowed_users: []          # public hex pubkeys or npubs
+            allow_all_users: false     # secure default: deny unlisted senders
 
 Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
@@ -189,7 +190,7 @@ def npub_to_hex(npub: str) -> Optional[str]:
     return bytes(decoded).hex()
 
 
-def _normalize_user_ref(ref: str) -> Optional[str]:
+def normalize_user_ref(ref: str) -> Optional[str]:
     """Normalize a user reference (hex pubkey or npub) to lowercase hex."""
     ref = (ref or "").strip().lower()
     if not ref:
@@ -199,6 +200,10 @@ def _normalize_user_ref(ref: str) -> Optional[str]:
     if re.fullmatch(r"[0-9a-f]{64}", ref):
         return ref
     return None
+
+
+# Backward-compatible private alias used by existing adapter internals/tests.
+_normalize_user_ref = normalize_user_ref
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +383,11 @@ class BuzzAdapter(BasePlatformAdapter):
         self.transport = _transport if _transport in ("auto", "websocket", "poll") else "auto"
 
         # Auth: entries may be hex pubkeys or npubs; normalized to hex
-        raw_allowed = os.getenv("BUZZ_ALLOWED_USERS") or extra.get("allowed_users", [])
+        raw_allowed = (
+            os.environ["BUZZ_ALLOWED_USERS"]
+            if "BUZZ_ALLOWED_USERS" in os.environ
+            else extra.get("allowed_users", [])
+        )
         if isinstance(raw_allowed, str):
             raw_allowed = raw_allowed.split(",")
         self._allowed_pubkeys: set = {
@@ -1258,12 +1267,35 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
     otherwise fail the ``check_fn`` gate and be silently skipped at gateway
     startup.  This hook bridges the ``extra`` block into env, mirroring the
     Slack/Telegram pattern.  Env vars win over YAML — every assignment is
-    guarded by ``not os.getenv(...)`` so explicit env overrides survive a
+    guarded by environment membership checks so even explicit empty overrides survive a
     config.yaml update.  ``BUZZ_PRIVATE_KEY`` is a secret and stays in ``.env``;
     it is never sourced from config.yaml here.
     """
-    extra = buzz_cfg.get("extra", buzz_cfg) or {}
-    if not isinstance(extra, dict):
+    merged_extra: dict = {}
+
+    def _merge_extra(candidate: Any) -> None:
+        if not isinstance(candidate, dict):
+            return
+        candidate_extra = candidate.get("extra", candidate) or {}
+        if isinstance(candidate_extra, dict):
+            merged_extra.update(candidate_extra)
+
+    # Preserve the gateway loader's precedence while allowing Dashboard-owned
+    # nested access controls to coexist with unrelated legacy top-level Buzz
+    # settings. Lowest precedence first; top-level ``buzz`` wins per key.
+    platforms_cfg = yaml_cfg.get("platforms")
+    if isinstance(platforms_cfg, dict):
+        _merge_extra(platforms_cfg.get("buzz"))
+    gateway_cfg = yaml_cfg.get("gateway")
+    if isinstance(gateway_cfg, dict):
+        gateway_platforms = gateway_cfg.get("platforms")
+        if isinstance(gateway_platforms, dict):
+            _merge_extra(gateway_platforms.get("buzz"))
+    _merge_extra(yaml_cfg.get("buzz"))
+    _merge_extra(buzz_cfg)
+
+    extra = merged_extra
+    if not extra:
         return None
     _str_keys = {
         "relay_url": "BUZZ_RELAY_URL",
@@ -1284,11 +1316,11 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
             channels = ",".join(str(c) for c in channels)
         os.environ["BUZZ_CHANNELS"] = str(channels)
     allowed = extra.get("allowed_users")
-    if allowed is not None and not os.getenv("BUZZ_ALLOWED_USERS"):
+    if allowed is not None and "BUZZ_ALLOWED_USERS" not in os.environ:
         if isinstance(allowed, (list, tuple)):
             allowed = ",".join(str(a) for a in allowed)
         os.environ["BUZZ_ALLOWED_USERS"] = str(allowed)
-    if "allow_all_users" in extra and not os.getenv("BUZZ_ALLOW_ALL_USERS"):
+    if "allow_all_users" in extra and "BUZZ_ALLOW_ALL_USERS" not in os.environ:
         os.environ["BUZZ_ALLOW_ALL_USERS"] = str(extra["allow_all_users"]).lower()
     if "require_mention" in extra and not os.getenv("BUZZ_REQUIRE_MENTION"):
         os.environ["BUZZ_REQUIRE_MENTION"] = str(extra["require_mention"]).lower()
@@ -1489,6 +1521,7 @@ def register(ctx):
         # Auth env vars for _is_user_authorized() integration
         allowed_users_env="BUZZ_ALLOWED_USERS",
         allow_all_env="BUZZ_ALLOW_ALL_USERS",
+        auth_identity_normalizer=_normalize_user_ref,
         # Display
         emoji="🐝",
         # Buzz identities are pubkeys, not phone numbers

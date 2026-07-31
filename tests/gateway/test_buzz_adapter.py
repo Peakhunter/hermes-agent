@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -23,6 +24,7 @@ check_requirements = _buzz_mod.check_requirements
 validate_config = _buzz_mod.validate_config
 register = _buzz_mod.register
 _env_enablement = _buzz_mod._env_enablement
+_apply_yaml_config = _buzz_mod._apply_yaml_config
 _standalone_send = _buzz_mod._standalone_send
 
 # Real key pair (Chip's public identity — public information, not a secret)
@@ -141,6 +143,57 @@ class TestBuzzAdapterInit:
         from gateway.config import PlatformConfig
         adapter = BuzzAdapter(PlatformConfig(enabled=True, extra={"relay_url": "https://cfg.relay"}))
         assert adapter.relay_url == "https://env.relay"
+
+    def test_dashboard_access_config_bridges_to_gateway_auth_env(self, monkeypatch):
+        _apply_yaml_config({}, {
+            "extra": {
+                "allowed_users": [SELF_NPUB, OTHER_PUBKEY],
+                "allow_all_users": False,
+            },
+        })
+
+        assert os.environ["BUZZ_ALLOWED_USERS"] == f"{SELF_NPUB},{OTHER_PUBKEY}"
+        assert os.environ["BUZZ_ALLOW_ALL_USERS"] == "false"
+
+    def test_explicit_empty_access_env_overrides_yaml(self, monkeypatch):
+        monkeypatch.setenv("BUZZ_ALLOWED_USERS", "")
+        monkeypatch.setenv("BUZZ_ALLOW_ALL_USERS", "")
+
+        _apply_yaml_config({}, {
+            "extra": {
+                "allowed_users": [OTHER_PUBKEY],
+                "allow_all_users": True,
+            },
+        })
+        from gateway.config import PlatformConfig
+        adapter = BuzzAdapter(PlatformConfig(
+            enabled=True,
+            extra={"allowed_users": [OTHER_PUBKEY]},
+        ))
+
+        assert os.environ["BUZZ_ALLOWED_USERS"] == ""
+        assert os.environ["BUZZ_ALLOW_ALL_USERS"] == ""
+        assert adapter._allowed_pubkeys == set()
+
+    def test_nested_access_config_survives_unrelated_top_level_buzz_config(self):
+        yaml_cfg = {
+            "buzz": {"extra": {"require_mention": False}},
+            "gateway": {
+                "platforms": {
+                    "buzz": {
+                        "extra": {
+                            "allowed_users": [SELF_NPUB],
+                            "allow_all_users": False,
+                        },
+                    },
+                },
+            },
+        }
+
+        _apply_yaml_config(yaml_cfg, yaml_cfg["buzz"])
+
+        assert os.environ["BUZZ_ALLOWED_USERS"] == SELF_NPUB
+        assert os.environ["BUZZ_ALLOW_ALL_USERS"] == "false"
 
 
 # ── CLI error contract ────────────────────────────────────────────────────
@@ -505,6 +558,7 @@ class TestBuzzPluginRegistration:
         assert kwargs["cron_deliver_env_var"] == "BUZZ_HOME_CHANNEL"
         assert kwargs["allowed_users_env"] == "BUZZ_ALLOWED_USERS"
         assert kwargs["allow_all_env"] == "BUZZ_ALLOW_ALL_USERS"
+        assert kwargs["auth_identity_normalizer"] is _normalize_user_ref
         assert callable(kwargs["standalone_sender_fn"])
         assert callable(kwargs["env_enablement_fn"])
         assert set(kwargs["required_env"]) == {"BUZZ_RELAY_URL", "BUZZ_PRIVATE_KEY"}

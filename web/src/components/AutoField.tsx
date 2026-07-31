@@ -5,7 +5,7 @@ import { Switch } from "@nous-research/ui/ui/components/switch";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { Label } from "@nous-research/ui/ui/components/label";
 
-import { updateListInputDraft } from "./autoFieldListInput";
+import { updateListInputDraft, validateBuzzAllowedUsers } from "./autoFieldListInput";
 
 function FieldHint({ schema, schemaKey }: { schema: Record<string, unknown>; schemaKey: string }) {
   const keyPath = schemaKey.includes(".") ? schemaKey : "";
@@ -40,10 +40,12 @@ function ListFieldInput({
   label,
   value,
   onChange,
+  error,
 }: {
   label: string;
   value: unknown;
   onChange: (v: unknown) => void;
+  error?: string | null;
 }) {
   const externalValue = formatListValue(value);
   const [draft, setDraft] = useState(externalValue);
@@ -59,6 +61,8 @@ function ListFieldInput({
   return (
     <Input
       aria-label={label}
+      aria-invalid={!!error}
+      aria-describedby={error ? `${label.replace(/\s+/g, "-").toLowerCase()}-error` : undefined}
       value={draft}
       onFocus={() => {
         editing.current = true;
@@ -221,11 +225,27 @@ export function AutoField({
   }
 
   if (schema.type === "list") {
+    const validationError =
+      schemaKey === "gateway.platforms.buzz.extra.allowed_users" ||
+      schemaKey === "buzz.extra.allowed_users"
+        ? validateBuzzAllowedUsers(value)
+        : null;
+    const errorId = `${label.replace(/\s+/g, "-").toLowerCase()}-error`;
     return (
       <div className="grid gap-1.5">
         <Label className="text-sm">{label}</Label>
         <FieldHint schema={schema} schemaKey={schemaKey} />
-        <ListFieldInput label={label} value={value} onChange={onChange} />
+        <ListFieldInput
+          label={label}
+          value={value}
+          onChange={onChange}
+          error={validationError}
+        />
+        {validationError && (
+          <p id={errorId} className="text-xs text-destructive" role="alert">
+            {validationError}
+          </p>
+        )}
       </div>
     );
   }

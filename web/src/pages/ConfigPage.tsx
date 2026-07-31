@@ -41,6 +41,7 @@ import { getNestedValue, setNestedValue } from "@/lib/nested";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { Toast } from "@nous-research/ui/ui/components/toast";
 import { AutoField } from "@/components/AutoField";
+import { getBuzzAllowedUsersValidationError } from "@/components/autoFieldListInput";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { ListItem } from "@nous-research/ui/ui/components/list-item";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
@@ -280,6 +281,11 @@ export default function ConfigPage() {
   /* ---- Handlers ---- */
   const handleSave = async () => {
     if (!config) return;
+    const buzzValidationError = getBuzzAllowedUsersValidationError(config);
+    if (buzzValidationError) {
+      showToast(`${t.config.failedToSave}: ${buzzValidationError}`, "error");
+      return;
+    }
     setSaving(true);
     try {
       await api.saveConfig(config);

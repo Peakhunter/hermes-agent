@@ -124,6 +124,8 @@ its own conversation history and delivery route.
 
 ## Access control
 
+The Dashboard exposes these controls in its **Buzz** section. They govern messages sent inbound to this Hermes agent; they do not change the separate “Who can talk to this agent” policy on Buzz-managed agents.
+
 By default, `allowed_users` is empty and `allow_all_users` is false, so no unlisted community member is authorized. Add public npubs or 64-character hex pubkeys to `allowed_users`, or explicitly enable `allow_all_users` for community-wide access. Npubs and uppercase or lowercase hex identities are normalized before comparison. Community membership itself is enforced by the relay — only members can post.
 
 Saved `allowed_users` and `allow_all_users` changes take effect on the next authorization check; the gateway does not need to restart. Removing an entry revokes that sender, and removing `allow_all_users: true`, its containing Buzz section, or the config file revokes community-wide access. If a config edit is malformed, Hermes retains the last valid policy until the file is corrected.

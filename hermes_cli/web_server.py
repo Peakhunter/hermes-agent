@@ -6899,26 +6899,34 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _validate_buzz_allowed_users(config: Dict[str, Any]) -> None:
-    """Reject malformed Buzz identities before persisting Dashboard config."""
-    current: Any = config
-    for key in ("gateway", "platforms", "buzz", "extra", "allowed_users"):
-        if not isinstance(current, dict) or key not in current:
-            return
-        current = current[key]
-    if not isinstance(current, list):
-        raise HTTPException(status_code=422, detail="Buzz Allowed Users must be a list")
-
+    """Reject malformed Buzz identities at either supported config path."""
     from plugins.platforms.buzz.adapter import normalize_user_ref
 
-    for index, value in enumerate(current, start=1):
-        if not isinstance(value, str) or normalize_user_ref(value) is None:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"Invalid Buzz public key at Allowed Users item {index}; "
-                    "use one npub or 64-character hex public key per item"
-                ),
-            )
+    paths = (
+        ("gateway", "platforms", "buzz", "extra", "allowed_users"),
+        ("buzz", "extra", "allowed_users"),
+    )
+    for path in paths:
+        current: Any = config
+        for key in path:
+            if not isinstance(current, dict) or key not in current:
+                break
+            current = current[key]
+        else:
+            if not isinstance(current, list):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Buzz Allowed Users must be a list",
+                )
+            for index, value in enumerate(current, start=1):
+                if not isinstance(value, str) or normalize_user_ref(value) is None:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Invalid Buzz public key at Allowed Users item {index}; "
+                            "use one npub or 64-character hex public key per item"
+                        ),
+                    )
 
 
 @app.put("/api/config")

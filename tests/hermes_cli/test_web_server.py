@@ -1903,6 +1903,17 @@ class TestConfigRoundTrip:
         assert resp.status_code == 422
         assert "Invalid Buzz public key" in resp.json()["detail"]
 
+    def test_rejects_invalid_top_level_buzz_allowed_user(self):
+        config = self.client.get("/api/config").json()
+        config["buzz"] = {
+            "extra": {"allowed_users": ["a" * 128]},
+        }
+
+        resp = self.client.put("/api/config", json={"config": config})
+
+        assert resp.status_code == 422
+        assert "Invalid Buzz public key" in resp.json()["detail"]
+
     def test_schema_types_match_config_values(self):
         """Every schema field should have a matching-type value in the config."""
         config = self.client.get("/api/config").json()

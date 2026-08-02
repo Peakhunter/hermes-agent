@@ -3218,11 +3218,26 @@ def delegate_task(
 
         _session_key = get_current_session_key(default="")
         _origin_ui_session_id = ""
+        _origin_route = {}
         try:
             from gateway.session_context import get_session_env
 
             _source = get_session_env("HERMES_SESSION_SOURCE", "")
             _origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
+            _origin_route = {
+                key: str(value).strip()
+                for key, value in {
+                    "platform": get_session_env("HERMES_SESSION_PLATFORM", ""),
+                    "chat_id": get_session_env("HERMES_SESSION_CHAT_ID", ""),
+                    "chat_type": get_session_env("HERMES_SESSION_CHAT_TYPE", ""),
+                    "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", ""),
+                    "user_id": get_session_env("HERMES_SESSION_USER_ID", ""),
+                    "user_name": get_session_env("HERMES_SESSION_USER_NAME", ""),
+                    "message_id": get_session_env("HERMES_SESSION_MESSAGE_ID", ""),
+                    "profile": get_session_env("HERMES_SESSION_PROFILE", ""),
+                }.items()
+                if str(value).strip()
+            }
             # In desktop/TUI, the routable session key is the durable
             # AIAgent.session_id. Context compression can rotate that id during
             # the same turn before the TUI-side session dict is re-anchored;
@@ -3324,6 +3339,7 @@ def delegate_task(
             role=top_role,
             model=creds["model"],
             session_key=_session_key,
+            origin_route=_origin_route,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
             parent_session_id=_parent_session_id,

@@ -764,6 +764,154 @@ class TestMentionGating:
         assert [item["message_id"] for item in adapter._dispatched] == ["e1"]
 
 
+class TestAcknowledgementAuthorization:
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_sender_gets_no_seen_reaction(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "buzz:\n"
+            "  extra:\n"
+            f"    allowed_users: [{SELF_NPUB}]\n"
+            "    allow_all_users: false\n",
+            encoding="utf-8",
+        )
+        adapter = _make_adapter()
+        adapter._message_handler = AsyncMock()
+        adapter.handle_message = AsyncMock()
+        adapter.send_reaction = AsyncMock(return_value=True)
+
+        await adapter._dispatch_message(
+            text="test",
+            chat_id=CHANNEL,
+            chat_type="group",
+            user_id=OTHER_PUBKEY,
+            user_name="Other",
+            message_id="e1",
+            created_at=10,
+        )
+
+        adapter.handle_message.assert_awaited_once()
+        adapter.send_reaction.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_sender_keeps_seen_reaction(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "buzz:\n"
+            "  extra:\n"
+            f"    allowed_users: [{OTHER_PUBKEY.upper()}]\n"
+            "    allow_all_users: false\n",
+            encoding="utf-8",
+        )
+        adapter = _make_adapter()
+        adapter._message_handler = AsyncMock()
+        adapter.handle_message = AsyncMock()
+        adapter.send_reaction = AsyncMock(return_value=True)
+
+        await adapter._dispatch_message(
+            text="test",
+            chat_id=CHANNEL,
+            chat_type="group",
+            user_id=OTHER_PUBKEY,
+            user_name="Other",
+            message_id="e1",
+            created_at=10,
+        )
+
+        adapter.send_reaction.assert_awaited_once_with(CHANNEL, "e1", "👀")
+
+    @pytest.mark.asyncio
+    async def test_explicit_env_allowlist_controls_seen_reaction(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("BUZZ_ALLOWED_USERS", OTHER_PUBKEY.upper())
+        (tmp_path / "config.yaml").write_text(
+            "buzz:\n  extra:\n    allow_all_users: false\n",
+            encoding="utf-8",
+        )
+        adapter = _make_adapter()
+        adapter._message_handler = AsyncMock()
+        adapter.handle_message = AsyncMock()
+        adapter.send_reaction = AsyncMock(return_value=True)
+
+        await adapter._dispatch_message(
+            text="test",
+            chat_id=CHANNEL,
+            chat_type="group",
+            user_id=OTHER_PUBKEY,
+            user_name="Other",
+            message_id="e1",
+            created_at=10,
+        )
+
+        adapter.send_reaction.assert_awaited_once_with(CHANNEL, "e1", "👀")
+
+    @pytest.mark.asyncio
+    async def test_explicit_empty_env_suppresses_runtime_seen_reaction(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("BUZZ_ALLOWED_USERS", "")
+        (tmp_path / "config.yaml").write_text(
+            "buzz:\n  extra:\n    allow_all_users: true\n",
+            encoding="utf-8",
+        )
+        adapter = _make_adapter()
+        adapter._message_handler = AsyncMock()
+        adapter.handle_message = AsyncMock()
+        adapter.send_reaction = AsyncMock(return_value=True)
+
+        await adapter._dispatch_message(
+            text="test",
+            chat_id=CHANNEL,
+            chat_type="group",
+            user_id=OTHER_PUBKEY,
+            user_name="Other",
+            message_id="e1",
+            created_at=10,
+        )
+
+        adapter.handle_message.assert_awaited_once()
+        adapter.send_reaction.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_multiplex_ack_uses_active_profile_scope(self, monkeypatch, tmp_path):
+        from agent import secret_scope
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("BUZZ_ALLOW_ALL_USERS", "true")
+        (tmp_path / "config.yaml").write_text("buzz:\n  extra: {}\n", encoding="utf-8")
+        token = secret_scope.set_secret_scope({"BUZZ_ALLOWED_USERS": SELF_PUBKEY})
+        secret_scope.set_multiplex_active(True)
+        try:
+            adapter = _make_adapter()
+            adapter._message_handler = AsyncMock()
+            adapter.handle_message = AsyncMock()
+            adapter.send_reaction = AsyncMock(return_value=True)
+
+            await adapter._dispatch_message(
+                text="test",
+                chat_id=CHANNEL,
+                chat_type="group",
+                user_id=OTHER_PUBKEY,
+                user_name="Other",
+                message_id="e1",
+                created_at=10,
+            )
+
+            adapter.handle_message.assert_awaited_once()
+            adapter.send_reaction.assert_not_awaited()
+        finally:
+            secret_scope.reset_secret_scope(token)
+            secret_scope.set_multiplex_active(False)
+
+
 # ── DM classification via p-tags (issue #68871) ──────────────────────────
 #
 # `buzz dms list` returns [] on some hosted relays, so DM conversations leak

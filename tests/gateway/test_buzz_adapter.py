@@ -853,7 +853,7 @@ class TestAcknowledgementAuthorization:
         adapter.send_reaction.assert_awaited_once_with(CHANNEL, "e1", "👀")
 
     @pytest.mark.asyncio
-    async def test_explicit_empty_env_suppresses_runtime_seen_reaction(
+    async def test_explicit_empty_allowlist_env_keeps_runtime_allow_all_reaction(
         self, monkeypatch, tmp_path
     ):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -877,8 +877,36 @@ class TestAcknowledgementAuthorization:
             created_at=10,
         )
 
-        adapter.handle_message.assert_awaited_once()
-        adapter.send_reaction.assert_not_awaited()
+        adapter.send_reaction.assert_awaited_once_with(CHANNEL, "e1", "👀")
+
+    @pytest.mark.asyncio
+    async def test_explicit_allow_all_env_keeps_runtime_allowlist_reaction(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("BUZZ_ALLOW_ALL_USERS", "false")
+        (tmp_path / "config.yaml").write_text(
+            "buzz:\n"
+            "  extra:\n"
+            f"    allowed_users: [{OTHER_PUBKEY}]\n",
+            encoding="utf-8",
+        )
+        adapter = _make_adapter()
+        adapter._message_handler = AsyncMock()
+        adapter.handle_message = AsyncMock()
+        adapter.send_reaction = AsyncMock(return_value=True)
+
+        await adapter._dispatch_message(
+            text="test",
+            chat_id=CHANNEL,
+            chat_type="group",
+            user_id=OTHER_PUBKEY,
+            user_name="Other",
+            message_id="e1",
+            created_at=10,
+        )
+
+        adapter.send_reaction.assert_awaited_once_with(CHANNEL, "e1", "👀")
 
     @pytest.mark.asyncio
     async def test_multiplex_ack_uses_active_profile_scope(self, monkeypatch, tmp_path):

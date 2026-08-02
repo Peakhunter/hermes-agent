@@ -382,6 +382,75 @@ def _bridge_yaml_env(env_name: str, value: Any) -> None:
         os.environ[marker] = bridged
 
 
+def _load_runtime_authorization_config(profile: Optional[str] = None) -> dict:
+    """Resolve the live, profile-scoped Buzz access policy from config.yaml."""
+    from hermes_cli.config import load_config_readonly
+
+    if profile:
+        from hermes_cli.profiles import get_profile_dir
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        token = set_hermes_home_override(str(get_profile_dir(profile)))
+        try:
+            config = load_config_readonly()
+        finally:
+            reset_hermes_home_override(token)
+    else:
+        config = load_config_readonly()
+    merged: Dict[str, Any] = {}
+
+    def _merge(candidate: Any) -> None:
+        if not isinstance(candidate, dict):
+            return
+        merged.update(
+            {
+                key: value
+                for key, value in candidate.items()
+                if key
+                not in {"enabled", "token", "home_channel", "home_channels", "extra"}
+            }
+        )
+        extra = candidate.get("extra")
+        if isinstance(extra, dict):
+            merged.update(extra)
+
+    if isinstance(config, dict):
+        gateway = config.get("gateway")
+        gateway_platforms = (
+            gateway.get("platforms") if isinstance(gateway, dict) else None
+        )
+        if isinstance(gateway_platforms, dict):
+            _merge(gateway_platforms.get("buzz"))
+
+        platforms = config.get("platforms")
+        if isinstance(platforms, dict):
+            _merge(platforms.get("buzz"))
+
+        if isinstance(gateway, dict):
+            _merge(gateway.get("buzz"))
+        _merge(config.get("buzz"))
+
+    policy: dict = {}
+    if "allowed_users" in merged:
+        raw_allowed = merged["allowed_users"]
+        if isinstance(raw_allowed, str):
+            raw_allowed = raw_allowed.split(",")
+        if not isinstance(raw_allowed, (list, tuple)):
+            raw_allowed = []
+        policy["allowed_users"] = [
+            normalized
+            for entry in raw_allowed
+            if isinstance(entry, str)
+            and (normalized := _normalize_user_ref(entry))
+        ]
+    if "allow_all_users" in merged:
+        policy["allow_all_users"] = merged["allow_all_users"]
+    return policy
+
+
 # ---------------------------------------------------------------------------
 # Buzz Adapter
 # ---------------------------------------------------------------------------
@@ -449,16 +518,6 @@ class BuzzAdapter(BasePlatformAdapter):
             os.getenv("BUZZ_TRANSPORT") or str(extra.get("transport", "auto") or "auto")
         ).strip().lower()
         self.transport = _transport if _transport in ("auto", "websocket", "poll") else "auto"
-
-        # Auth: entries may be hex pubkeys or npubs; normalized to hex
-        raw_allowed = os.getenv("BUZZ_ALLOWED_USERS") or extra.get("allowed_users", [])
-        if isinstance(raw_allowed, str):
-            raw_allowed = raw_allowed.split(",")
-        self._allowed_pubkeys: set = {
-            normalized
-            for entry in raw_allowed
-            if isinstance(entry, str) and (normalized := _normalize_user_ref(entry))
-        }
 
         # Secret — resolved lazily (never at import/registration time and
         # never logged).  connect() re-resolves it to fail fast with a clear
@@ -1195,12 +1254,6 @@ class BuzzAdapter(BasePlatformAdapter):
             reply_target
             and thread_root in state.get("agent_thread_ids", {})
         )
-        # Adapter-level allow-list (the gateway applies BUZZ_ALLOWED_USERS /
-        # BUZZ_ALLOW_ALL_USERS centrally as well; empty list = no filter here).
-        if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
-            logger.debug("Buzz: ignoring message from unauthorized pubkey %s…", pubkey[:8])
-            return
-
         # Top-level and thread mention gates are independent, matching Slack:
         # thread_require_mention can keep replies gated even when top-level
         # channel messages are free-response. DMs always dispatch.
@@ -1211,7 +1264,6 @@ class BuzzAdapter(BasePlatformAdapter):
                 if reply_target:
                     self._remember_pending_thread_event(state, event)
                 return
-
         # Strip a leading @mention so slash commands (@Chip /whoami ->
         # /whoami) and clean prompts are recognized. DM messages often still
         # open with "@Chip" even though no mention is required there, so the
@@ -1515,13 +1567,6 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
         if isinstance(channels, (list, tuple)):
             channels = ",".join(str(c) for c in channels)
         os.environ["BUZZ_CHANNELS"] = str(channels)
-    allowed = extra.get("allowed_users")
-    if allowed is not None and not os.getenv("BUZZ_ALLOWED_USERS"):
-        if isinstance(allowed, (list, tuple)):
-            allowed = ",".join(str(a) for a in allowed)
-        os.environ["BUZZ_ALLOWED_USERS"] = str(allowed)
-    if "allow_all_users" in extra and not os.getenv("BUZZ_ALLOW_ALL_USERS"):
-        os.environ["BUZZ_ALLOW_ALL_USERS"] = str(extra["allow_all_users"]).lower()
     if "require_mention" in extra:
         _bridge_yaml_env("BUZZ_REQUIRE_MENTION", extra["require_mention"])
     if "thread_require_mention" in extra:
@@ -1722,9 +1767,11 @@ def register(ctx):
         # cron jobs fail with "No live adapter" when cron runs separately
         # from the gateway.
         standalone_sender_fn=_standalone_send,
-        # Auth env vars for _is_user_authorized() integration
+        # Auth env vars and live config resolver for central authorization.
         allowed_users_env="BUZZ_ALLOWED_USERS",
         allow_all_env="BUZZ_ALLOW_ALL_USERS",
+        authorization_config_fn=_load_runtime_authorization_config,
+        authorization_user_normalizer=_normalize_user_ref,
         # Display
         emoji="🐝",
         # Buzz identities are pubkeys, not phone numbers

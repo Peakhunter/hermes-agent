@@ -1495,7 +1495,7 @@ class BuzzAdapter(BasePlatformAdapter):
         )
         if not allow_all_present and "allow_all_users" in policy:
             allow_all_value = str(policy["allow_all_users"])
-        if allow_all_value.strip().lower() in {"true", "1", "yes", "on"}:
+        if allow_all_value.strip().lower() in {"true", "1", "yes"}:
             return True
 
         allowed_present, allowed_value = explicit_value("BUZZ_ALLOWED_USERS")

@@ -853,6 +853,34 @@ class TestAcknowledgementAuthorization:
         adapter.send_reaction.assert_awaited_once_with(CHANNEL, "e1", "👀")
 
     @pytest.mark.asyncio
+    async def test_noncanonical_allow_all_env_does_not_ack_sender(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("BUZZ_ALLOW_ALL_USERS", "on")
+        (tmp_path / "config.yaml").write_text(
+            "buzz:\n  extra:\n    allow_all_users: false\n",
+            encoding="utf-8",
+        )
+        adapter = _make_adapter()
+        adapter._message_handler = AsyncMock()
+        adapter.handle_message = AsyncMock()
+        adapter.send_reaction = AsyncMock(return_value=True)
+
+        await adapter._dispatch_message(
+            text="test",
+            chat_id=CHANNEL,
+            chat_type="group",
+            user_id=OTHER_PUBKEY,
+            user_name="Other",
+            message_id="e1",
+            created_at=10,
+        )
+
+        adapter.handle_message.assert_awaited_once()
+        adapter.send_reaction.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_explicit_empty_allowlist_env_keeps_runtime_allow_all_reaction(
         self, monkeypatch, tmp_path
     ):

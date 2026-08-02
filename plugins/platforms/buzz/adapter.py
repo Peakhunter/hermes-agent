@@ -1488,28 +1488,26 @@ class BuzzAdapter(BasePlatformAdapter):
                 return True, os.environ.get(name, "")
             return False, ""
 
-        allowed_env_present, allowed_env = explicit_value("BUZZ_ALLOWED_USERS")
-        allow_all_env_present, allow_all_env = explicit_value(
+        policy = _load_runtime_authorization_config(profile)
+
+        allow_all_present, allow_all_value = explicit_value(
             "BUZZ_ALLOW_ALL_USERS"
         )
-        if allowed_env_present or allow_all_env_present:
-            allow_all = allow_all_env.strip().lower() in {
-                "true",
-                "1",
-                "yes",
-                "on",
-            }
+        if not allow_all_present and "allow_all_users" in policy:
+            allow_all_value = str(policy["allow_all_users"])
+        if allow_all_value.strip().lower() in {"true", "1", "yes", "on"}:
+            return True
+
+        allowed_present, allowed_value = explicit_value("BUZZ_ALLOWED_USERS")
+        if allowed_present:
             allowed = {
                 normalized
-                for raw in allowed_env.split(",")
+                for raw in allowed_value.split(",")
                 if (normalized := _normalize_user_ref(raw))
             }
-            return bool(allow_all or (sender and sender in allowed))
-
-        policy = _load_runtime_authorization_config(profile)
-        if policy.get("allow_all_users") is True:
-            return True
-        return bool(sender and sender in policy.get("allowed_users", []))
+        else:
+            allowed = set(policy.get("allowed_users", []))
+        return bool(sender and sender in allowed)
 
     async def _dispatch_message(
         self,
@@ -1544,7 +1542,7 @@ class BuzzAdapter(BasePlatformAdapter):
         await self.handle_message(event)
         
         # Acknowledgements are cosmetic only; central authorization remains
-        # the enforcement point.  Keep unauthorized group traffic silent.
+        # the enforcement point. Keep unauthorized traffic silent.
         if self._should_ack_sender(user_id, getattr(source, "profile", None)):
             try:
                 await self.send_reaction(chat_id, message_id, "👀")

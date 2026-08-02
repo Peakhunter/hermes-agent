@@ -14338,6 +14338,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and self._get_unauthorized_dm_behavior(
                     source.platform,
                     profile=source.profile,
+                    source=source,
                 )
                 == "pair"
             ):

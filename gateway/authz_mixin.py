@@ -857,6 +857,7 @@ class GatewayAuthorizationMixin:
         platform: Optional[Platform],
         *,
         profile: Optional[str] = None,
+        source: Optional[SessionSource] = None,
     ) -> str:
         """Return how unauthorized DMs should be handled for a platform.
 
@@ -875,6 +876,11 @@ class GatewayAuthorizationMixin:
         6. No allowlist and no explicit config → ``"pair"`` (open-gateway default).
         """
         config = getattr(self, "config", None)
+        policy_profile = (
+            self._adapter_profile_for_source(source)
+            if source is not None
+            else profile
+        )
 
         # Check for an explicit per-platform override first.
         if config and hasattr(config, "get_unauthorized_dm_behavior") and platform:
@@ -903,7 +909,7 @@ class GatewayAuthorizationMixin:
         # Prefer the profile-scoped live adapter's resolved policy in multiplex
         # mode; fall back to the default profile's config.extra.
         if platform:
-            dm_policy = self._adapter_dm_policy(platform, profile=profile)
+            dm_policy = self._adapter_dm_policy(platform, profile=policy_profile)
             if not dm_policy and config and hasattr(config, "platforms"):
                 platform_cfg = config.platforms.get(platform)
                 extra = getattr(platform_cfg, "extra", None) if platform_cfg else None
@@ -936,13 +942,24 @@ class GatewayAuthorizationMixin:
                         not allowlist_present
                         and plugin_entry.authorization_config_fn is not None
                     ):
-                        resolved = plugin_entry.authorization_config_fn(profile)
+                        resolved = plugin_entry.authorization_config_fn(policy_profile)
                         if isinstance(resolved, dict) and _coerce_allow_set(
                             resolved.get("allowed_users")
                         ):
                             return "ignore"
-            except Exception:
-                pass
+            except Exception as exc:
+                # Central authorization also denies when a plugin policy cannot
+                # be resolved. Never turn that fail-closed denial into an
+                # externally visible pairing response.
+                from gateway.run import logger
+
+                logger.warning(
+                    "Failed to resolve runtime authorization policy for %s; "
+                    "ignoring unauthorized DM: %s",
+                    platform.value,
+                    exc,
+                )
+                return "ignore"
 
             platform_env_map = {
                 Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",

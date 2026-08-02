@@ -868,12 +868,10 @@ class GatewayAuthorizationMixin:
         3. Explicit global ``unauthorized_dm_behavior`` in config — wins for
            chat-shaped platforms when no per-platform override is set.
         4. When an adapter-level DM policy opts into pairing or silent drop, honor it.
-        5. When an allowlist (``PLATFORM_ALLOWED_USERS``,
-           ``PLATFORM_GROUP_ALLOWED_USERS`` / ``PLATFORM_GROUP_ALLOWED_CHATS``,
-           or ``GATEWAY_ALLOWED_USERS``) is configured, default to ``"ignore"`` —
-           the allowlist signals that the owner has deliberately restricted
-           access; spamming unknown contacts with pairing codes is both noisy
-           and a potential info-leak. (#9337)
+        5. When a core-platform or plugin-provided allowlist is configured,
+           default to ``"ignore"`` — the allowlist signals that the owner has
+           deliberately restricted access; spamming unknown contacts with
+           pairing codes is both noisy and a potential info-leak. (#9337)
         6. No allowlist and no explicit config → ``"pair"`` (open-gateway default).
         """
         config = getattr(self, "config", None)
@@ -920,6 +918,32 @@ class GatewayAuthorizationMixin:
         # if any allowlist is configured for this platform, silently drop
         # unauthorized messages instead of sending pairing codes.
         if platform:
+            # Plugin platforms can supply both env-backed gates and a live,
+            # profile-scoped config policy.  Apply the same absent-vs-empty env
+            # precedence used by _is_user_authorized: an explicit env value
+            # overrides config, including an explicitly empty value.
+            try:
+                from gateway.platform_registry import platform_registry
+
+                plugin_entry = platform_registry.get(platform.value)
+                if plugin_entry is not None:
+                    allowlist_present, plugin_allowlist = (
+                        _platform_gate_env_present(plugin_entry.allowed_users_env)
+                    )
+                    if plugin_allowlist:
+                        return "ignore"
+                    if (
+                        not allowlist_present
+                        and plugin_entry.authorization_config_fn is not None
+                    ):
+                        resolved = plugin_entry.authorization_config_fn(profile)
+                        if isinstance(resolved, dict) and _coerce_allow_set(
+                            resolved.get("allowed_users")
+                        ):
+                            return "ignore"
+            except Exception:
+                pass
+
             platform_env_map = {
                 Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",
                 Platform.DISCORD:  "DISCORD_ALLOWED_USERS",

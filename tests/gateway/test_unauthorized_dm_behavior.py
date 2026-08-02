@@ -296,6 +296,62 @@ async def test_signal_with_allowlist_ignores_unauthorized_dm(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_buzz_config_allowlist_ignores_unauthorized_dm(monkeypatch, tmp_path):
+    """A config-only Buzz allowlist must not leak a pairing response."""
+    from gateway.platform_registry import PlatformEntry, platform_registry
+    from plugins.platforms.buzz.adapter import (
+        _load_runtime_authorization_config,
+        _normalize_user_ref,
+    )
+
+    _clear_auth_env(monkeypatch)
+    monkeypatch.delenv("BUZZ_ALLOWED_USERS", raising=False)
+    monkeypatch.delenv("BUZZ_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    allowed_pubkey = "a" * 64
+    unauthorized_pubkey = "b" * 64
+    (tmp_path / "config.yaml").write_text(
+        "buzz:\n"
+        "  extra:\n"
+        f"    allowed_users: [{allowed_pubkey}]\n"
+        "    allow_all_users: false\n",
+        encoding="utf-8",
+    )
+
+    buzz = Platform("buzz")
+    previous_entry = platform_registry.get("buzz")
+    platform_registry.register(
+        PlatformEntry(
+            name="buzz",
+            label="Buzz",
+            adapter_factory=lambda _cfg: None,
+            check_fn=lambda: True,
+            allowed_users_env="BUZZ_ALLOWED_USERS",
+            allow_all_env="BUZZ_ALLOW_ALL_USERS",
+            authorization_config_fn=_load_runtime_authorization_config,
+            authorization_user_normalizer=_normalize_user_ref,
+        )
+    )
+    try:
+        config = GatewayConfig(
+            platforms={buzz: PlatformConfig(enabled=True)},
+        )
+        runner, adapter = _make_runner(buzz, config)
+
+        result = await runner._handle_message(
+            _make_event(buzz, unauthorized_pubkey, "unauthorized-dm")
+        )
+
+        assert result is None
+        runner.pairing_store.generate_code.assert_not_called()
+        adapter.send.assert_not_awaited()
+    finally:
+        platform_registry.unregister("buzz")
+        if previous_entry is not None:
+            platform_registry.register(previous_entry)
+
+
+@pytest.mark.asyncio
 async def test_telegram_with_allowlist_ignores_unauthorized_dm(monkeypatch):
     """Same behavior for Telegram: allowlist ⟹ ignore unauthorized DMs."""
     _clear_auth_env(monkeypatch)

@@ -107,6 +107,8 @@ gateway:
 - `require_mention` controls top-level shared-channel messages; `thread_require_mention` independently controls thread replies. Both default to `true`.
 - With `require_mention: true` and `thread_require_mention: false`, a mention is required to start a conversation, then unmentioned follow-ups are accepted only in a thread where Hermes has successfully sent a reply. Unrelated threads remain gated.
 - Explicit `BUZZ_REQUIRE_MENTION` and `BUZZ_THREAD_REQUIRE_MENTION` environment values override YAML. Dashboard-saved YAML values take effect on the next inbound Buzz event; a missing or malformed saved value preserves the last working policy.
+- In shared channels the agent only responds when **addressed** — by `@name`, its npub, or its hex pubkey. Everything else is ignored.
+- If Buzz rejects an outbound message because an `@name` is unknown or ambiguous, Hermes removes only that offending mention marker and retries. If a retry identifies another invalid name, this repeats up to three fallback attempts in total. If the message exceeds Buzz's mention limit, all mention markers are removed for the retry. Readable text, email addresses, reply threads, attachments, and remaining content are preserved; neutralized names do not notify users.
 - Direct messages always reach the agent, no mention needed.
 - The agent's own messages are never dispatched back to it (self-echo suppression by pubkey), and every event is de-duplicated by event id against a per-channel high-water mark.
 

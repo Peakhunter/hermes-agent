@@ -1192,6 +1192,22 @@ class TestBuzzAdapterSend:
         # Our own event id is marked seen for echo suppression
         assert "evt123" in adapter._channel_state[CHANNEL]["seen"]
 
+    @pytest.mark.asyncio
+    async def test_send_metadata_thread_id_uses_reply_to_flag(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt124", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(
+            CHANNEL,
+            "working",
+            metadata={"thread_id": "buzz-event-123"},
+        )
+
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "buzz-event-123"
 
     @pytest.mark.asyncio
     async def test_send_retries_unresolved_mentions_as_readable_text(self):

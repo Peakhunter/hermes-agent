@@ -37,11 +37,13 @@ environment and is never logged.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import tempfile
 import time
 from collections import OrderedDict
 from datetime import datetime
@@ -77,9 +79,11 @@ logger = logging.getLogger(__name__)
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
-    SendResult,
     MessageEvent,
     MessageType,
+    SendResult,
+    cache_image_from_bytes,
+    validate_inbound_media_size,
 )
 from gateway.config import Platform
 
@@ -99,6 +103,21 @@ _DM_DISCOVERY_EVERY = 5
 _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
 _CLI_TIMEOUT = 30.0
+
+_BUZZ_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]\r\n]*\]\((https?://[^)\s]+)\)")
+_BUZZ_MEDIA_IMAGE_PATH_RE = re.compile(
+    r"/media/([0-9a-f]{64})\.(png|jpe?g|gif|webp|bmp)",
+    re.IGNORECASE,
+)
+_BUZZ_IMAGE_MIME = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "webp": "image/webp",
+    "bmp": "image/bmp",
+}
+_MAX_BUZZ_IMAGES_PER_MESSAGE = 4
 
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 # kind 44100 is Buzz's channel-membership event — used for live DM discovery.
@@ -1294,6 +1313,12 @@ class BuzzAdapter(BasePlatformAdapter):
             await self._retry_pending_thread_events(channel_id, state)
             return
 
+        # Reject unauthorized senders before any authenticated media fetch or
+        # profile lookup. This mirrors the gateway's live authorization policy
+        # while keeping protected relay resources inaccessible to rejected input.
+        if not self._should_ack_sender(pubkey):
+            return
+
         # Reclassify a leaked DM before gating so its first un-mentioned
         # message both latches the conversation and dispatches.
         self._maybe_latch_dm(channel_id, state, event)
@@ -1323,6 +1348,10 @@ class BuzzAdapter(BasePlatformAdapter):
         # strip applies to both chat types.
         dispatch_text = self._strip_mention(content)
 
+        dispatch_text, media_urls, media_types = await self._ingest_buzz_images(
+            dispatch_text
+        )
+
         await self._dispatch_message(
             text=dispatch_text,
             chat_id=channel_id,
@@ -1331,7 +1360,10 @@ class BuzzAdapter(BasePlatformAdapter):
             user_name=await self._resolve_user_name(pubkey),
             message_id=event_id,
             created_at=created_at,
-            thread_id=_event_reply_target(event),
+            thread_id=reply_target,
+            message_type=MessageType.PHOTO if media_urls else MessageType.TEXT,
+            media_urls=media_urls,
+            media_types=media_types,
         )
 
     def _refresh_mention_policy(self) -> None:
@@ -1371,6 +1403,105 @@ class BuzzAdapter(BasePlatformAdapter):
             self._mention_config_signature = signature
         except Exception:
             logger.debug("Buzz: could not refresh mention policy", exc_info=True)
+
+    def _buzz_image_metadata(self, url: str) -> Optional[Tuple[str, str, str]]:
+        """Return ``(sha256, extension, MIME)`` for this relay's image URL."""
+        relay = urlsplit(self.relay_url)
+        candidate = urlsplit(url)
+        if (
+            candidate.scheme.lower() != relay.scheme.lower()
+            or candidate.netloc.lower() != relay.netloc.lower()
+            or candidate.username is not None
+            or candidate.password is not None
+            or candidate.query
+            or candidate.fragment
+        ):
+            return None
+        match = _BUZZ_MEDIA_IMAGE_PATH_RE.fullmatch(candidate.path)
+        if match is None:
+            return None
+        digest, extension = match.groups()
+        extension = extension.lower()
+        return digest.lower(), f".{extension}", _BUZZ_IMAGE_MIME[extension]
+
+    @staticmethod
+    def _buzz_image_removal_span(
+        text: str, span: Tuple[int, int]
+    ) -> Tuple[int, int]:
+        """Expand standalone image markup to its line without touching neighbours."""
+        start, end = span
+        line_start = text.rfind("\n", 0, start) + 1
+        line_end = text.find("\n", end)
+        if line_end < 0:
+            line_end = len(text)
+        if text[line_start:start].strip() or text[end:line_end].strip():
+            return span
+        if line_end < len(text):
+            return line_start, line_end + 1
+        if line_start > 0:
+            return line_start - 1, line_end
+        return line_start, line_end
+
+    async def _ingest_buzz_images(self, text: str) -> Tuple[str, List[str], List[str]]:
+        """Authenticated-download protected Buzz Markdown images for vision."""
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        consumed_spans: List[Tuple[int, int]] = []
+        download_attempts = 0
+
+        for match in _BUZZ_MARKDOWN_IMAGE_RE.finditer(text):
+            url = match.group(1)
+            metadata = self._buzz_image_metadata(url)
+            if metadata is None:
+                continue
+            if download_attempts >= _MAX_BUZZ_IMAGES_PER_MESSAGE:
+                break
+            download_attempts += 1
+            expected_digest, extension, mime = metadata
+            fd, temporary_path = tempfile.mkstemp(
+                prefix="hermes_buzz_media_", suffix=extension
+            )
+            os.close(fd)
+            try:
+                code, _out, _err = await self._run_cli(
+                    ["media", "get", url, "--output", temporary_path]
+                )
+                if code != 0:
+                    logger.warning(
+                        "Buzz: authenticated inbound image download failed (exit %d)",
+                        code,
+                    )
+                    continue
+                path = Path(temporary_path)
+                validate_inbound_media_size(path.stat().st_size, media_type="image")
+                data = path.read_bytes()
+                if hashlib.sha256(data).hexdigest() != expected_digest:
+                    logger.warning("Buzz: inbound image hash did not match its media URL")
+                    continue
+                cached_path = cache_image_from_bytes(data, ext=extension)
+                os.chmod(cached_path, 0o600)
+                media_urls.append(cached_path)
+                media_types.append(mime)
+                consumed_spans.append(
+                    self._buzz_image_removal_span(text, match.span())
+                )
+            except (OSError, ValueError):
+                logger.warning("Buzz: could not cache authenticated inbound image", exc_info=True)
+            finally:
+                try:
+                    Path(temporary_path).unlink()
+                except OSError:
+                    pass
+
+        merged_spans: List[List[int]] = []
+        for start, end in sorted(consumed_spans):
+            if merged_spans and start <= merged_spans[-1][1]:
+                merged_spans[-1][1] = max(merged_spans[-1][1], end)
+            else:
+                merged_spans.append([start, end])
+        for start, end in reversed(merged_spans):
+            text = text[:start] + text[end:]
+        return text, media_urls, media_types
 
     # ── DM classification (issue #68871) ──────────────────────────────────
     #
@@ -1573,6 +1704,9 @@ class BuzzAdapter(BasePlatformAdapter):
         message_id: str,
         created_at: int,
         thread_id: Optional[str] = None,
+        message_type: MessageType = MessageType.TEXT,
+        media_urls: Optional[List[str]] = None,
+        media_types: Optional[List[str]] = None,
     ) -> None:
         """Build a MessageEvent and hand it to the base class handler."""
         if not self._message_handler:
@@ -1596,10 +1730,12 @@ class BuzzAdapter(BasePlatformAdapter):
 
         event = MessageEvent(
             text=text,
-            message_type=MessageType.TEXT,
+            message_type=message_type,
             source=source,
             message_id=message_id,
             timestamp=datetime.fromtimestamp(created_at) if created_at else datetime.now(),
+            media_urls=media_urls or [],
+            media_types=media_types or [],
         )
 
         await self.handle_message(event)

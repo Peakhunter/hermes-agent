@@ -1060,6 +1060,9 @@ class TestMentionGating:
             dispatched.append(event)
 
         adapter._message_handler = capture
+        # This test exercises Buzz source/thread construction, not BasePlatformAdapter's
+        # fire-and-forget task scheduler. Keep dispatch synchronous and deterministic.
+        adapter.handle_message = capture
         root_id = "f" * 64
         reply_id = "e" * 64
 

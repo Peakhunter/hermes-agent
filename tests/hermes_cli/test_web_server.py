@@ -2016,7 +2016,7 @@ class TestBuildSchemaFromConfig:
         assert extra["allowed_users"] == ["npub1legacy"]
         assert extra["allow_all_users"] is True
 
-    def test_dashboard_can_close_existing_nested_buzz_allow_all(self, monkeypatch):
+    def test_dashboard_can_close_existing_nested_buzz_allow_all(self):
         from hermes_cli.config import (
             get_config_path,
             load_config,
@@ -2042,10 +2042,10 @@ class TestBuildSchemaFromConfig:
         raw_extra = read_raw_config()["gateway"]["platforms"]["buzz"]["extra"]
         assert raw_extra["allow_all_users"] is False
 
-        monkeypatch.delenv("BUZZ_ALLOW_ALL_USERS", raising=False)
-        from gateway.config import load_gateway_config
-        load_gateway_config()
-        assert os.environ["BUZZ_ALLOW_ALL_USERS"] == "false"
+        from plugins.platforms.buzz.adapter import _load_runtime_authorization_config
+
+        runtime_policy = _load_runtime_authorization_config(None)
+        assert runtime_policy["allow_all_users"] is False
 
     def test_dynamic_merge_recomputes_memory_provider_options(self, monkeypatch):
         """The per-request schema merge re-discovers memory providers.

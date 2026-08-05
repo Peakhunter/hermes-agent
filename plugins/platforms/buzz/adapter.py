@@ -242,7 +242,7 @@ def npub_to_hex(npub: str) -> Optional[str]:
     return bytes(decoded).hex()
 
 
-def _normalize_user_ref(ref: str) -> Optional[str]:
+def normalize_user_ref(ref: str) -> Optional[str]:
     """Normalize a user reference (hex pubkey or npub) to lowercase hex."""
     ref = (ref or "").strip().lower()
     if not ref:
@@ -252,6 +252,10 @@ def _normalize_user_ref(ref: str) -> Optional[str]:
     if re.fullmatch(r"[0-9a-f]{64}", ref):
         return ref
     return None
+
+
+# Backward-compatible private alias for existing plugin imports.
+_normalize_user_ref = normalize_user_ref
 
 
 # ---------------------------------------------------------------------------

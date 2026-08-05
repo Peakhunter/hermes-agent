@@ -31,7 +31,7 @@ def test_buzz_npub_allowlist_authorizes_hex_sender(monkeypatch):
         check_fn=lambda: True,
         allowed_users_env="BUZZ_ALLOWED_USERS",
         allow_all_env="BUZZ_ALLOW_ALL_USERS",
-        auth_identity_normalizer=_buzz_mod._normalize_user_ref,
+        authorization_user_normalizer=_buzz_mod.normalize_user_ref,
     ))
     monkeypatch.setenv("BUZZ_ALLOWED_USERS", SELF_NPUB)
     monkeypatch.setenv("BUZZ_ALLOW_ALL_USERS", "false")

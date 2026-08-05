@@ -95,8 +95,8 @@ gateway:
 - `tool_progress: off` — suppresses tool progress bubbles (e.g., "Running terminal command...", "Reading file..."). Keeps the channel focused on actual results, not process.
 - `poll_interval: 4` — balances inbound latency (up to 4s delay) against relay load. Lower values increase polling frequency; higher values reduce it.
 - `allowed_users: []` + `allow_all_users: false` — private mode by default. Only listed users can interact. Set `allow_all_users: true` for community mode where everyone can chat (admin tier still restricted to the owner).
-- `require_mention: true` — in channels, the agent only responds when addressed. DMs always dispatch regardless of this setting.
-- `thread_require_mention: true` — preserves strict thread behavior: every reply needs a fresh mention. Set it to `false` to allow unmentioned follow-ups only after Hermes has successfully replied in that thread.
+- `require_mention: true` — in channels, the agent only responds to an explicit native `@name` mention or exact npub/hex identity. A bare display name in prose, a path, or a hyphenated identifier is not a mention. DMs always dispatch regardless of this setting.
+- `thread_require_mention: true` — preserves strict thread behavior: every reply needs a fresh mention. Set it to `false` to allow unmentioned follow-ups after Hermes has successfully replied in a thread or when a user opens a thread from a top-level message authored by Hermes.
 
 **Rationale:** Channels are for final results and conversation, not for the agent's internal tool execution log. Users see the final answer, not the steps taken to get there. This matches the behavior on Telegram and email, which already have these defaults.
 
@@ -105,7 +105,8 @@ gateway:
 ## Mentions, channels, and DMs
 
 - `require_mention` controls top-level shared-channel messages; `thread_require_mention` independently controls thread replies. Both default to `true`.
-- With `require_mention: true` and `thread_require_mention: false`, a mention is required to start a conversation, then unmentioned follow-ups are accepted only in a thread where Hermes has successfully sent a reply. Unrelated threads remain gated.
+- A top-level mention is explicit: Buzz's native `@name` mention (or an exact npub/hex identity). Bare names in ordinary prose, filesystem paths, and hyphenated identifiers do not satisfy the gate.
+- With `require_mention: true` and `thread_require_mention: false`, an explicit mention is required to start a conversation, then unmentioned follow-ups are accepted in threads where Hermes has participated. This includes a thread a user opens by replying to a top-level message authored by Hermes. Unrelated threads remain gated.
 - Explicit `BUZZ_REQUIRE_MENTION` and `BUZZ_THREAD_REQUIRE_MENTION` environment values override YAML. Dashboard-saved YAML values take effect on the next inbound Buzz event; a missing or malformed saved value preserves the last working policy.
 - In shared channels the agent only responds when **addressed** — by `@name`, its npub, or its hex pubkey. Everything else is ignored.
 - If Buzz rejects an outbound message because an `@name` is unknown or ambiguous, Hermes removes only that offending mention marker and retries. If a retry identifies another invalid name, this repeats up to three fallback attempts in total. If the message exceeds Buzz's mention limit, all mention markers are removed for the retry. Readable text, email addresses, reply threads, attachments, and remaining content are preserved; neutralized names do not notify users.

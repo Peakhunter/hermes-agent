@@ -166,6 +166,12 @@ export function shouldPreserveCtrlJNewline(env: MinimalEnv = process.env): boole
     return true
   }
 
+  const term = (env.TERM ?? '').toLowerCase()
+
+  if (term === 'tmux' || term.startsWith('tmux-')) {
+    return true
+  }
+
   if (env.GHOSTTY_RESOURCES_DIR || env.GHOSTTY_BIN_DIR) {
     return true
   }

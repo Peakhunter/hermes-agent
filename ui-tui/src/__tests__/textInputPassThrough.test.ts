@@ -16,6 +16,10 @@ describe('shouldPreserveCtrlJNewline', () => {
     ).toBe(true)
   })
 
+  it('preserves Ctrl+J as newline inside tmux without inherited SSH markers', () => {
+    expect(shouldPreserveCtrlJNewline({ TERM: 'tmux-256color' })).toBe(true)
+  })
+
   it('keeps bare local POSIX LF-compatible prompts submitting on Ctrl+J', () => {
     expect(shouldPreserveCtrlJNewline({ TERM: 'xterm-256color' })).toBe(false)
   })

@@ -2,7 +2,7 @@
 
 The Buzz adapter connects Hermes to a [Buzz](https://github.com/block/buzz) community — Block's open-source human+agent collaboration platform built on the Nostr protocol — and relays messages between Buzz channels (or DMs) and the agent. Outbound traffic shells out to the `buzz` CLI binary ("JSON in, JSON out"); inbound uses a native Nostr WebSocket subscription (via the already-bundled `websockets` package) with CLI polling as fallback. **No extra Python packages are required** — just the `buzz` binary.
 
-Buzz renders markdown, so agent replies keep their formatting. Outbound images are delivered as uploads (local files) or links (URLs). For inbound messages from authorized senders, same-relay Markdown images under Buzz's content-addressed `/media/` path are downloaded with the agent identity's existing Buzz authentication, integrity-checked against the URL hash, cached locally with owner-only permissions, and passed through Hermes' normal image pipeline. External image URLs remain links. Replies can thread onto an existing message via its event id. When progress or status messages are enabled, they inherit the triggering Buzz event as their reply anchor instead of appearing as unrelated top-level channel posts.
+Buzz renders markdown, so agent replies keep their formatting. Outbound images are delivered as uploads (local files) or links (URLs). For inbound messages from authorized senders, same-relay Markdown images under Buzz's content-addressed `/media/` path are downloaded with the agent identity's existing Buzz authentication, integrity-checked against the URL hash, cached locally with owner-only permissions, and passed through Hermes' normal image pipeline. External image URLs remain links. A reply to a top-level DM or shared-channel message opens one thread under the triggering message; subsequent replies remain attached to the stable NIP-10 root instead of creating nested child threads. Progress and status messages inherit that same reply anchor. Direct sends and restored self-echoes are remembered as agent-authored thread roots, so replies to those roots remain eligible under the active-thread mention policy. Display-name activation is explicit: use `@Name`; a bare name embedded in ordinary prose or a path is not a mention. Exact npub and 64-character hex identity references remain supported.
 
 Inbound messages arrive over a persistent NIP-42-authenticated Nostr WebSocket subscription by default (near-instant delivery), with automatic fallback to CLI polling when the WebSocket can't be established. Outbound messages always go through the `buzz` CLI. Control it with `transport` / `BUZZ_TRANSPORT`: `auto` (default), `websocket` (require WS, fail otherwise), or `poll`. If your relay membership uses NIP-OA owner attestation, set `BUZZ_AUTH_TAG` to the four-string auth tag JSON.
 
@@ -33,6 +33,7 @@ gateway:
         poll_interval: 4           # seconds between inbound poll sweeps
         cli_path: ""               # buzz binary (default: PATH, then ~/bin/buzz)
         credentials_file: ""       # JSON file with the nsec (BUZZ_PRIVATE_KEY fallback)
+        activity_owner_pubkey: ""  # optional owner npub/hex; enables encrypted View activity events
         allowed_users: []          # public hex pubkeys or npubs
         allow_all_users: false     # secure default: deny unlisted senders
         require_mention: true      # require a mention in shared channels (default: true)
@@ -60,6 +61,19 @@ BUZZ_PRIVATE_KEY=nsec1...
 | `BUZZ_POLL_INTERVAL` | — | Seconds between inbound poll sweeps (default: 4) |
 | `BUZZ_CLI_PATH` | — | Path to the `buzz` binary (default: `buzz` on PATH, then `~/bin/buzz`) |
 | `BUZZ_CREDENTIALS_FILE` | — | JSON credentials file holding the nsec, used when `BUZZ_PRIVATE_KEY` is unset |
+| `BUZZ_AUTH_TAG` | — | Owner-signed NIP-OA attestation for this agent identity; required by hosted relays for owner-authorized activity |
+
+## Native Gateway activity
+
+Set `gateway.platforms.buzz.extra.activity_owner_pubkey` in `config.yaml` to publish native Hermes turn and tool lifecycle activity for Buzz's **View activity** panel. This non-secret behavior setting is intentionally configuration-only; environment variables remain reserved for credentials and deployment concerns. Hermes remains the execution engine: this observer stream does not route the turn through Buzz ACP.
+
+Activity events are ephemeral NIP-AO events (kind `24200`), encrypted to the owner with NIP-44 and signed by the configured agent identity. Tool activity contains only a bounded tool name, a turn-local opaque call ID, and status. Hermes deliberately omits provider call IDs, tool arguments, results, model text, credentials, code, queries, and local paths.
+
+Activity transport is bounded and fail-open. Ordinary progress and liveness frames are dropped while the WebSocket is unavailable. A terminal completion, cancellation, timeout, or failure that occurs during a temporary outage is retained in a bounded, terminal-only replay buffer and sent once on reconnect so a previously observed turn cannot remain stuck as working indefinitely.
+
+The setting is optional and fail-open. If it is absent, no observer events are emitted. If encryption, signing, WebSocket delivery, or relay acceptance fails, the normal Hermes turn and Buzz reply continue unaffected. A malformed owner key is rejected at startup rather than silently disabling activity.
+
+The Buzz relay must recognize the signing identity as an agent owned by that owner and must authorize the owner as an observer. Signing a valid kind-`24200` event alone does not grant relay authorization.
 
 ## Recommended default settings
 
@@ -81,6 +95,7 @@ gateway:
           - ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
         home_channel: ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
         poll_interval: 4                  # seconds between inbound poll sweeps (default 4 — balances latency vs. relay load)
+        activity_owner_pubkey: ""         # optional owner npub/hex; enables encrypted View activity events
         cli_path: ""                      # buzz binary (default: PATH, then ~/bin/buzz)
         credentials_file: ""              # JSON file with the nsec (BUZZ_PRIVATE_KEY fallback)
         allowed_users: []                 # empty = allow all if allow_all_users is true; otherwise restrict to listed npubs/hex pubkeys

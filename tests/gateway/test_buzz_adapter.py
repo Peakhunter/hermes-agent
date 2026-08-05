@@ -404,6 +404,19 @@ class TestMentionGating:
         assert adapter._dispatched == []
 
     @pytest.mark.asyncio
+    async def test_display_name_inside_repository_path_is_not_a_mention(self, adapter):
+        await self._poll_with(
+            adapter,
+            _event(
+                "e1",
+                content="Did you update /projects/chip-server-buzz-recovery?",
+                created_at=10,
+            ),
+        )
+
+        assert adapter._dispatched == []
+
+    @pytest.mark.asyncio
     async def test_unmentioned_followup_dispatches_after_agent_replies_when_thread_mentions_disabled(self):
         adapter = _make_adapter({"thread_require_mention": False})
         adapter._dispatched = []
@@ -441,6 +454,67 @@ class TestMentionGating:
         )
 
         assert [d["message_id"] for d in adapter._dispatched] == ["root", "followup"]
+
+    @pytest.mark.asyncio
+    async def test_unmentioned_reply_to_agent_authored_root_is_dispatched(self):
+        adapter = _make_adapter({"thread_require_mention": False})
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group",
+            "last_ts": 0,
+            "seen": {},
+        }
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "send",
+            {"accepted": True, "event_id": "agent-root", "message": ""},
+        )
+        adapter._run_cli = cli
+        await adapter.send(CHANNEL, "Recovery status")
+
+        await self._poll_with(
+            adapter,
+            _tagged_event(
+                "followup",
+                CHANNEL,
+                content="What should we do?",
+                created_at=12,
+                reply_to="agent-root",
+            ),
+        )
+
+        assert [d["message_id"] for d in adapter._dispatched] == ["followup"]
+
+    @pytest.mark.asyncio
+    async def test_agent_authored_root_is_restored_from_self_echo(self, adapter):
+        adapter.thread_require_mention = False
+
+        await self._poll_with(
+            adapter,
+            _tagged_event(
+                "agent-root",
+                CHANNEL,
+                pubkey=SELF_PUBKEY,
+                content="Recovery status",
+                created_at=11,
+            ),
+            _tagged_event(
+                "followup",
+                CHANNEL,
+                content="What should we do?",
+                created_at=12,
+                reply_to="agent-root",
+            ),
+        )
+
+        assert [d["message_id"] for d in adapter._dispatched] == ["followup"]
 
     @pytest.mark.asyncio
     async def test_nested_unmentioned_followup_stays_in_agent_thread(self):
@@ -661,6 +735,46 @@ class TestMentionGating:
         assert [d["message_id"] for d in adapter._dispatched] == ["followup"]
 
     @pytest.mark.asyncio
+    async def test_seeded_agent_authored_root_restores_followups_after_restart(self):
+        adapter = _make_adapter({"thread_require_mention": False})
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "get",
+            [
+                _tagged_event(
+                    "agent-root",
+                    CHANNEL,
+                    content="Recovery status",
+                    pubkey=SELF_PUBKEY,
+                    created_at=11,
+                ),
+            ],
+        )
+        adapter._run_cli = cli
+        await adapter._seed_channel(CHANNEL, chat_type="group")
+
+        await self._poll_with(
+            adapter,
+            _tagged_event(
+                "followup",
+                CHANNEL,
+                content="What should we do?",
+                created_at=12,
+                reply_to="agent-root",
+            ),
+        )
+
+        assert [d["message_id"] for d in adapter._dispatched] == ["followup"]
+
+    @pytest.mark.asyncio
     async def test_early_followup_retries_after_agent_echo_arrives(self):
         adapter = _make_adapter({"thread_require_mention": False})
         adapter._dispatched = []
@@ -779,6 +893,18 @@ class TestMentionGating:
         )
 
         assert adapter._dispatched[0]["thread_id"] == root_id
+
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            ("hey @cHiP can you help?", True),
+            ("Chip, can you help?", False),
+            (f"nostr:{SELF_NPUB} hello", True),
+            (f"identity {SELF_PUBKEY.upper()}", True),
+        ],
+    )
+    def test_explicit_mention_contract(self, adapter, content, expected):
+        assert adapter._is_mentioned(content) is expected
 
     @pytest.mark.asyncio
     async def test_protected_buzz_markdown_image_is_downloaded_for_vision(
@@ -1746,6 +1872,31 @@ class TestBuzzAdapterSend:
         assert result.success is True
         args, _stdin = cli.calls[0]
         assert args[args.index("--file") + 1] == str(img)
+
+    @pytest.mark.asyncio
+    async def test_top_level_image_send_opens_active_thread(self, tmp_path):
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group",
+            "last_ts": 0,
+            "seen": {},
+        }
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "send",
+            {"accepted": True, "event_id": "agent-image-root", "message": ""},
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send_image(CHANNEL, str(img), caption="screenshot")
+
+        assert result.success is True
+        assert list(adapter._channel_state[CHANNEL]["agent_thread_ids"]) == [
+            "agent-image-root"
+        ]
 
     @pytest.mark.asyncio
     async def test_send_image_reply_targets_root_and_opens_active_thread(self, tmp_path):

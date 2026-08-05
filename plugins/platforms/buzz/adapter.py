@@ -804,12 +804,15 @@ class BuzzAdapter(BasePlatformAdapter):
     def _remember_agent_thread_event(self, state: dict, event: dict) -> None:
         if str(event.get("pubkey") or "").lower() != self._self_pubkey:
             return
-        reply_target = _event_reply_target(event)
-        if not reply_target:
-            return
         event_id = str(event.get("id") or "")
-        root = self._resolve_thread_root(state, reply_target)
-        self._remember_agent_thread_ids(state, root, event_id)
+        reply_target = _event_reply_target(event)
+        if reply_target:
+            root = self._resolve_thread_root(state, reply_target)
+            self._remember_agent_thread_ids(state, root, event_id)
+        else:
+            # A user can start a thread by replying to one of the agent's
+            # top-level events, so that event is itself a participated root.
+            self._remember_agent_thread_ids(state, event_id)
 
     @staticmethod
     def _remember_pending_thread_event(state: dict, event: dict) -> None:
@@ -881,11 +884,18 @@ class BuzzAdapter(BasePlatformAdapter):
             # Belt-and-braces echo suppression: the poll loop already skips
             # our own pubkey, but marking the id seen makes de-dupe explicit.
             self._mark_seen(str(chat_id), str(event_id))
-            if reply_target and state is not None:
-                self._remember_thread_root(state, str(event_id), str(reply_target))
-                self._remember_agent_thread_ids(
-                    state, str(reply_target), str(event_id)
-                )
+            if state is not None:
+                # Any accepted outbound event can become a thread root when a
+                # user replies to it later, even when this send was top-level.
+                if reply_target:
+                    self._remember_thread_root(
+                        state, str(event_id), str(reply_target)
+                    )
+                    self._remember_agent_thread_ids(
+                        state, str(reply_target), str(event_id)
+                    )
+                else:
+                    self._remember_agent_thread_ids(state, str(event_id))
         return SendResult(
             success=accepted,
             message_id=str(event_id) if event_id else None,
@@ -970,13 +980,16 @@ class BuzzAdapter(BasePlatformAdapter):
             accepted = bool(data.get("accepted", True))
             if event_id and accepted:
                 self._mark_seen(str(chat_id), str(event_id))
-                if reply_target and state is not None:
-                    self._remember_thread_root(
-                        state, str(event_id), str(reply_target)
-                    )
-                    self._remember_agent_thread_ids(
-                        state, str(reply_target), str(event_id)
-                    )
+                if state is not None:
+                    if reply_target:
+                        self._remember_thread_root(
+                            state, str(event_id), str(reply_target)
+                        )
+                        self._remember_agent_thread_ids(
+                            state, str(reply_target), str(event_id)
+                        )
+                    else:
+                        self._remember_agent_thread_ids(state, str(event_id))
             return SendResult(
                 success=accepted,
                 message_id=str(event_id) if event_id else None,
@@ -1617,14 +1630,20 @@ class BuzzAdapter(BasePlatformAdapter):
         logger.info("Buzz: conversation %s reclassified as DM (message p-tagged to self)", channel_id)
 
     def _is_mentioned(self, content: str) -> bool:
-        """True when the message addresses this agent (npub, hex, or name)."""
+        """True when content explicitly addresses this agent.
+
+        Buzz's native ``@display-name`` mention produces a structural ``p`` tag.
+        Requiring the ``@`` here also prevents paths and identifiers such as
+        ``/projects/chip-server`` from being mistaken for mentions. Exact npub
+        and hexadecimal identities remain explicit addressing forms.
+        """
         lowered = content.lower()
         if self._self_pubkey and self._self_pubkey in lowered:
             return True
         if self._self_npub and self._self_npub in lowered:
             return True
         if self._display_name:
-            pattern = rf"(?<!\w)@?{re.escape(self._display_name.lower())}(?!\w)"
+            pattern = rf"(?<!\w)@{re.escape(self._display_name.lower())}(?!\w)"
             if re.search(pattern, lowered):
                 return True
         return False

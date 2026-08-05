@@ -470,6 +470,7 @@ def _stream_adapter():
         send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="i")),
         send_video=AsyncMock(return_value=SendResult(success=True, message_id="vid")),
         send_multiple_images=AsyncMock(return_value=SendResult(success=True, message_id="ii")),
+        _send_multiple_images_with_routing=AsyncMock(),
     )
 
 
@@ -493,9 +494,13 @@ async def test_streamed_explicit_media_resend_is_delivered(tmp_path, monkeypatch
         adapter,
     )
 
-    adapter.send_multiple_images.assert_awaited_once()
-    sent_paths = [p for p, _cap in adapter.send_multiple_images.await_args.kwargs["images"]]
+    adapter._send_multiple_images_with_routing.assert_awaited_once()
+    sent_paths = [
+        p
+        for p, _cap in adapter._send_multiple_images_with_routing.await_args.kwargs["images"]
+    ]
     assert str(img) in sent_paths[0]
+    adapter.send_multiple_images.assert_not_awaited()
 
 
 def test_stream_rescan_accepts_no_history_dedup_input():

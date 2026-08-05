@@ -9,6 +9,7 @@ lifecycle as wired into BuzzAdapter.
 import asyncio
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -85,6 +86,77 @@ def test_build_auth_event_shape_and_owner_tag():
     assert event["pubkey"] == nostr_auth.public_key_hex(TEST_PRIVATE_KEY)
 
 
+def test_nip44_encrypt_matches_official_vector():
+    """Observer payload encryption must be byte-compatible with NIP-44 v2."""
+    sender_private_key = "00" * 31 + "01"
+    recipient_private_key = "00" * 31 + "02"
+    recipient_pubkey = nostr_auth.public_key_hex(recipient_private_key)
+
+    payload = nostr_auth.nip44_encrypt(
+        "a",
+        private_key=sender_private_key,
+        recipient_pubkey=recipient_pubkey,
+        nonce=bytes.fromhex("00" * 31 + "01"),
+    )
+
+    assert payload == (
+        "AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABee0G5VSK0/9YypIObAtD"
+        "KfYEAjD35uVkHyB0F4DwrcNaCXlCWZKaArsGrY6M9wnuTMxWfp1RTN9Xga8no+"
+        "kF5Vsb"
+    )
+
+
+def test_nip44_encrypt_rejects_non_spec_plaintext_above_65535_bytes():
+    with pytest.raises(ValueError, match="1 to 65535 bytes"):
+        nostr_auth.nip44_encrypt(
+            "a" * 65_536,
+            private_key="00" * 31 + "01",
+            recipient_pubkey=nostr_auth.public_key_hex("00" * 31 + "02"),
+            nonce=bytes(32),
+        )
+
+
+def test_build_observer_event_encrypts_and_signs_nip_ao_shape(monkeypatch):
+    owner_private_key = "00" * 31 + "02"
+    owner_pubkey = nostr_auth.public_key_hex(owner_private_key)
+    captured = {}
+
+    def fake_encrypt(plaintext, **kwargs):
+        captured["plaintext"] = plaintext
+        captured.update(kwargs)
+        return "encrypted-observer-payload"
+
+    monkeypatch.setattr(nostr_auth, "nip44_encrypt", fake_encrypt)
+    payload = {
+        "seq": 1,
+        "timestamp": "2026-08-03T14:00:00.000Z",
+        "kind": "turn_started",
+        "agentIndex": None,
+        "channelId": CHANNEL,
+        "sessionId": "session-1",
+        "turnId": "turn-1",
+        "payload": {"source": "channel"},
+    }
+
+    event = nostr_auth.build_observer_event(
+        private_key=TEST_PRIVATE_KEY,
+        owner_pubkey=owner_pubkey,
+        payload=payload,
+        created_at=1_700_000_000,
+        auxiliary_randomness=bytes(32),
+    )
+
+    assert event["kind"] == 24200
+    assert event["content"] == "encrypted-observer-payload"
+    assert ["p", owner_pubkey] in event["tags"]
+    assert ["agent", event["pubkey"]] in event["tags"]
+    assert ["frame", "telemetry"] in event["tags"]
+    assert json.loads(captured["plaintext"]) == payload
+    assert captured["private_key"] == TEST_PRIVATE_KEY
+    assert captured["recipient_pubkey"] == owner_pubkey
+    assert len(bytes.fromhex(event["sig"])) == 64
+
+
 # ── Adapter WS wiring ─────────────────────────────────────────────────────
 
 
@@ -119,3 +191,373 @@ async def test_websocket_auth_raises_on_rejection():
         await adapter._authenticate_websocket(RejectingWs())
 
 
+@pytest.mark.asyncio
+async def test_publish_activity_sends_encrypted_observer_event_over_active_websocket():
+    owner_private_key = "00" * 31 + "02"
+    owner_pubkey = nostr_auth.public_key_hex(owner_private_key)
+    adapter = _make_adapter({"activity_owner_pubkey": owner_pubkey})
+    websocket = _FakeWebSocket()
+    adapter._ws_active = True
+    adapter._ws_connection = websocket
+
+    published = await adapter.publish_activity(
+        "turn_started",
+        channel_id=CHANNEL,
+        session_id="session-1",
+        turn_id="turn-1",
+        started_at="2026-08-03T14:00:00.000Z",
+        payload={"source": "channel"},
+    )
+
+    assert published is True
+    await asyncio.wait_for(adapter._activity_queue.join(), timeout=1)
+    assert len(websocket.sent) == 1
+    frame = websocket.sent[0]
+    assert frame[0] == "EVENT"
+    assert frame[1]["kind"] == 24200
+    assert ["p", owner_pubkey] in frame[1]["tags"]
+    assert ["agent", frame[1]["pubkey"]] in frame[1]["tags"]
+    assert ["frame", "telemetry"] in frame[1]["tags"]
+    adapter._activity_sender_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._activity_sender_task
+
+
+@pytest.mark.asyncio
+async def test_publish_activity_does_not_wait_for_backpressured_websocket():
+    owner_pubkey = nostr_auth.public_key_hex("2".zfill(64))
+    adapter = _make_adapter(extra={"activity_owner_pubkey": owner_pubkey})
+
+    class _BackpressuredWebSocket:
+        async def send(self, _payload):
+            await asyncio.Event().wait()
+
+    adapter._ws_connection = _BackpressuredWebSocket()
+    adapter._ws_active = True
+
+    published = await asyncio.wait_for(
+        adapter.publish_activity(
+            "turn_started",
+            channel_id="channel-1",
+            session_id="session-1",
+            turn_id="turn-1",
+            payload={},
+        ),
+        timeout=0.05,
+    )
+
+    assert published is True
+    assert adapter._activity_sender_task is not None
+    adapter._activity_sender_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._activity_sender_task
+
+
+def test_activity_owner_pubkey_rejects_malformed_config():
+    with pytest.raises(ValueError, match="activity_owner_pubkey"):
+        _make_adapter({"activity_owner_pubkey": "not-a-pubkey"})
+
+
+@pytest.mark.asyncio
+async def test_publish_activity_fails_open_when_websocket_send_fails():
+    owner_pubkey = nostr_auth.public_key_hex("00" * 31 + "02")
+    adapter = _make_adapter({"activity_owner_pubkey": owner_pubkey})
+
+    class BrokenWebSocket:
+        async def send(self, raw):
+            raise ConnectionError("relay unavailable")
+
+    adapter._ws_active = True
+    adapter._ws_connection = BrokenWebSocket()
+
+    assert await adapter.publish_activity(
+        "turn_completed",
+        channel_id=CHANNEL,
+        session_id="session-1",
+        turn_id="turn-1",
+    ) is True
+    await asyncio.wait_for(adapter._activity_queue.join(), timeout=1)
+    assert not adapter._activity_pending_event_ids
+    adapter._activity_sender_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._activity_sender_task
+
+
+@pytest.mark.asyncio
+async def test_observer_relay_rejection_is_correlated_and_logged(caplog):
+    owner_pubkey = nostr_auth.public_key_hex("2".zfill(64))
+    adapter = _make_adapter(extra={"activity_owner_pubkey": owner_pubkey})
+    websocket = _FakeWebSocket()
+    adapter._ws_connection = websocket
+    adapter._ws_active = True
+
+    assert await adapter.publish_activity(
+        "turn_started",
+        channel_id="channel-1",
+        session_id="session-1",
+        turn_id="turn-1",
+        started_at="2026-08-03T14:00:00.000Z",
+        payload={},
+    ) is True
+    await asyncio.wait_for(adapter._activity_queue.join(), timeout=1)
+    event_id = websocket.sent[0][1]["id"]
+    assert event_id in adapter._activity_pending_event_ids
+
+    with caplog.at_level("WARNING"):
+        assert adapter._handle_activity_ack(
+            ["OK", event_id, False, "restricted: not authorized"]
+        ) is True
+
+    assert event_id not in adapter._activity_pending_event_ids
+    assert "restricted: not authorized" in caplog.text
+    adapter._activity_sender_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._activity_sender_task
+
+
+@pytest.mark.asyncio
+async def test_disconnect_drops_stale_activity_queue_and_pending_acks():
+    adapter = _make_adapter()
+    adapter._track_activity_ack("event-id", adapter._activity_ws_generation)
+    _, timer = adapter._activity_pending_event_ids["event-id"]
+    adapter._activity_queue.put_nowait({"kind": "turn_liveness"})
+
+    await adapter.disconnect()
+
+    assert adapter._activity_queue.empty()
+    assert not adapter._activity_pending_event_ids
+    assert timer.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_terminal_during_disconnect_replays_once_after_reconnect(monkeypatch):
+    owner_pubkey = nostr_auth.public_key_hex("00" * 31 + "02")
+    adapter = _make_adapter({"activity_owner_pubkey": owner_pubkey})
+    old_websocket = _FakeWebSocket()
+    adapter._ws_active = True
+    adapter._ws_connection = old_websocket
+
+    counter = 0
+
+    def build_event(**kwargs):
+        nonlocal counter
+        counter += 1
+        return {
+            "id": f"event-{counter}",
+            "kind": 24200,
+            "payload": kwargs["payload"],
+        }
+
+    monkeypatch.setattr(
+        _buzz_mod,
+        "_load_nostr_auth",
+        lambda: SimpleNamespace(build_observer_event=build_event),
+    )
+
+    assert adapter._enqueue_activity(
+        "turn_started",
+        channel_id=CHANNEL,
+        session_id="session-1",
+        turn_id="turn-1",
+    )
+    await asyncio.wait_for(adapter._activity_queue.join(), timeout=1)
+    assert [frame[1]["payload"]["kind"] for frame in old_websocket.sent] == [
+        "turn_started"
+    ]
+
+    adapter._ws_active = False
+    adapter._ws_connection = None
+    await adapter._reset_activity_transport()
+    assert not adapter._enqueue_activity(
+        "turn_liveness",
+        channel_id=CHANNEL,
+        session_id="session-1",
+        turn_id="turn-1",
+    )
+    assert adapter._enqueue_activity(
+        "turn_completed",
+        channel_id=CHANNEL,
+        session_id="session-1",
+        turn_id="turn-1",
+    )
+
+    new_websocket = _FakeWebSocket()
+    adapter._activity_ws_generation += 1
+    adapter._ws_connection = new_websocket
+    adapter._ws_active = True
+    adapter._replay_terminal_activity()
+    await asyncio.wait_for(adapter._activity_queue.join(), timeout=1)
+
+    assert [frame[1]["payload"]["kind"] for frame in new_websocket.sent] == [
+        "turn_completed"
+    ]
+    assert not adapter._activity_terminal_replay
+    adapter._replay_terminal_activity()
+    await asyncio.sleep(0)
+    assert len(new_websocket.sent) == 1
+    adapter._activity_sender_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._activity_sender_task
+
+
+def test_terminal_replay_is_bounded_and_keeps_latest_turns(monkeypatch):
+    owner_pubkey = nostr_auth.public_key_hex("00" * 31 + "02")
+    adapter = _make_adapter({"activity_owner_pubkey": owner_pubkey})
+    monkeypatch.setattr(_buzz_mod, "_ACTIVITY_TERMINAL_REPLAY_CAP", 2)
+
+    for turn_id in ("turn-1", "turn-2", "turn-3"):
+        assert adapter._enqueue_activity(
+            "turn_error",
+            channel_id=CHANNEL,
+            session_id="session-1",
+            turn_id=turn_id,
+            payload={"status": "failed"},
+        )
+
+    assert list(adapter._activity_terminal_replay) == ["turn-2", "turn-3"]
+
+
+@pytest.mark.asyncio
+async def test_unacked_terminal_is_recovered_when_socket_disconnects(monkeypatch):
+    owner_pubkey = nostr_auth.public_key_hex("00" * 31 + "02")
+    adapter = _make_adapter({"activity_owner_pubkey": owner_pubkey})
+    old_websocket = _FakeWebSocket()
+    adapter._ws_active = True
+    adapter._ws_connection = old_websocket
+
+    counter = 0
+
+    def build_event(**kwargs):
+        nonlocal counter
+        counter += 1
+        return {
+            "id": f"event-{counter}",
+            "kind": 24200,
+            "payload": kwargs["payload"],
+        }
+
+    monkeypatch.setattr(
+        _buzz_mod,
+        "_load_nostr_auth",
+        lambda: SimpleNamespace(build_observer_event=build_event),
+    )
+
+    assert adapter._enqueue_activity(
+        "turn_completed",
+        channel_id=CHANNEL,
+        session_id="session-1",
+        turn_id="turn-1",
+    )
+    await asyncio.wait_for(adapter._activity_queue.join(), timeout=1)
+    assert "event-1" in adapter._activity_pending_event_ids
+
+    adapter._ws_active = False
+    adapter._ws_connection = None
+    await adapter._reset_activity_transport()
+    assert not adapter._activity_pending_event_ids
+    assert list(adapter._activity_terminal_replay) == ["turn-1"]
+
+    new_websocket = _FakeWebSocket()
+    adapter._activity_ws_generation += 1
+    adapter._ws_connection = new_websocket
+    adapter._ws_active = True
+    adapter._replay_terminal_activity()
+    await asyncio.wait_for(adapter._activity_queue.join(), timeout=1)
+
+    assert [frame[1]["payload"]["kind"] for frame in new_websocket.sent] == [
+        "turn_completed"
+    ]
+    adapter._activity_sender_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._activity_sender_task
+
+
+@pytest.mark.asyncio
+async def test_activity_sender_drops_frame_when_websocket_generation_changes(monkeypatch):
+    owner_pubkey = nostr_auth.public_key_hex("00" * 31 + "02")
+    adapter = _make_adapter({"activity_owner_pubkey": owner_pubkey})
+    old_websocket = _FakeWebSocket()
+    new_websocket = _FakeWebSocket()
+    adapter._ws_active = True
+    adapter._ws_connection = old_websocket
+    adapter._activity_ws_generation = 1
+
+    def build_during_reconnect(**kwargs):
+        adapter._activity_ws_generation = 2
+        adapter._ws_connection = new_websocket
+        return {"id": "event-id"}
+
+    monkeypatch.setattr(
+        _buzz_mod,
+        "_load_nostr_auth",
+        lambda: SimpleNamespace(build_observer_event=build_during_reconnect),
+    )
+    adapter._activity_queue.put_nowait((1, {"kind": "turn_liveness"}))
+    adapter._activity_sender_task = asyncio.create_task(adapter._activity_sender_loop())
+
+    await asyncio.wait_for(adapter._activity_queue.join(), timeout=1)
+    adapter._activity_sender_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._activity_sender_task
+
+    assert old_websocket.sent == []
+    assert new_websocket.sent == []
+    assert not adapter._activity_pending_event_ids
+
+
+@pytest.mark.asyncio
+async def test_activity_ack_expires_on_deadline_and_late_ack_is_ignored(monkeypatch):
+    owner_pubkey = nostr_auth.public_key_hex("00" * 31 + "02")
+    adapter = _make_adapter({"activity_owner_pubkey": owner_pubkey})
+    websocket = _FakeWebSocket()
+    adapter._ws_active = True
+    adapter._ws_connection = websocket
+    monkeypatch.setattr(_buzz_mod, "_ACTIVITY_ACK_TIMEOUT", 0.01)
+
+    assert await adapter.publish_activity(
+        "turn_started",
+        channel_id=CHANNEL,
+        session_id="session-1",
+        turn_id="turn-1",
+        payload={},
+    )
+    await asyncio.wait_for(adapter._activity_queue.join(), timeout=1)
+    event_id = websocket.sent[0][1]["id"]
+    assert event_id in adapter._activity_pending_event_ids
+
+    await asyncio.sleep(0.03)
+    assert event_id not in adapter._activity_pending_event_ids
+    assert adapter._handle_activity_ack(["OK", event_id, True, "late"]) is False
+
+    adapter._activity_sender_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._activity_sender_task
+
+
+@pytest.mark.asyncio
+async def test_activity_pending_ack_cap_cancels_evicted_deadline(monkeypatch):
+    adapter = _make_adapter()
+    monkeypatch.setattr(_buzz_mod, "_ACTIVITY_PENDING_CAP", 2)
+
+    adapter._track_activity_ack("first", 1)
+    first_timer = adapter._activity_pending_event_ids["first"][1]
+    adapter._track_activity_ack("second", 1)
+    adapter._track_activity_ack("third", 1)
+
+    assert list(adapter._activity_pending_event_ids) == ["second", "third"]
+    assert first_timer.cancelled()
+    await adapter._reset_activity_transport()
+
+
+def test_activity_owner_pubkey_rejects_non_curve_x_coordinate():
+    with pytest.raises(ValueError, match="activity_owner_pubkey"):
+        _make_adapter({"activity_owner_pubkey": "f" * 64})
+
+
+def test_activity_owner_pubkey_is_config_only(monkeypatch):
+    env_owner = nostr_auth.public_key_hex("00" * 31 + "02")
+    monkeypatch.setenv("BUZZ_ACTIVITY_OWNER_PUBKEY", env_owner)
+
+    adapter = _make_adapter()
+
+    assert adapter.activity_owner_pubkey == ""

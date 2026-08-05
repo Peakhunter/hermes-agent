@@ -22,9 +22,10 @@ Configuration in config.yaml::
               - ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
             home_channel: ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
             poll_interval: 4           # seconds between poll sweeps
+            activity_owner_pubkey: ""  # owner npub/hex for encrypted activity
             cli_path: ""               # path to the buzz binary (default: PATH, then ~/bin/buzz)
             credentials_file: ""       # JSON file holding the nsec (fallback for BUZZ_PRIVATE_KEY)
-            allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
+            allowed_users: []          # secure default: deny unless allow_all_users is true
 
 Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
@@ -46,7 +47,7 @@ import shutil
 import tempfile
 import time
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
@@ -125,6 +126,12 @@ _WS_AUTH_TIMEOUT = 20.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
+_ACTIVITY_QUEUE_SIZE = 256
+_ACTIVITY_SEND_TIMEOUT = 2.0
+_ACTIVITY_ACK_TIMEOUT = 30.0
+_ACTIVITY_PENDING_CAP = 1024
+_ACTIVITY_TERMINAL_REPLAY_CAP = 256
+_ACTIVITY_TERMINAL_KINDS = frozenset({"turn_completed", "turn_error"})
 
 _FALSE_VALUES = frozenset({"false", "0", "no", "off"})
 _YAML_BRIDGE_MARKER_PREFIX = "_HERMES_YAML_BRIDGED_"
@@ -428,24 +435,53 @@ def _bridge_yaml_env(env_name: str, value: Any) -> None:
         os.environ[marker] = bridged
 
 
+_RUNTIME_AUTHORIZATION_POLICY_CACHE: Dict[str, dict] = {}
+
+
+def _copy_authorization_policy(policy: dict) -> dict:
+    copied = dict(policy)
+    if isinstance(copied.get("allowed_users"), list):
+        copied["allowed_users"] = list(copied["allowed_users"])
+    return copied
+
+
 def _load_runtime_authorization_config(profile: Optional[str] = None) -> dict:
     """Resolve the live, profile-scoped Buzz access policy from config.yaml."""
-    from hermes_cli.config import load_config_readonly
+    from hermes_cli.config import _expand_env_vars, read_user_config_raw
+    from hermes_cli.managed_scope import apply_managed_overlay
 
-    if profile:
-        from hermes_cli.profiles import get_profile_dir
-        from hermes_constants import (
-            reset_hermes_home_override,
-            set_hermes_home_override,
+    cache_key = profile or "default"
+
+    try:
+        if profile:
+            from hermes_cli.profiles import get_profile_dir
+            from hermes_constants import (
+                reset_hermes_home_override,
+                set_hermes_home_override,
+            )
+
+            token = set_hermes_home_override(str(get_profile_dir(profile)))
+            try:
+                config = read_user_config_raw()
+            finally:
+                reset_hermes_home_override(token)
+        else:
+            config = read_user_config_raw()
+        # This policy is presence-sensitive: merged defaults would make an
+        # absent key indistinguishable from an explicit deny. Expand user refs
+        # and apply the administrator overlay without merging DEFAULT_CONFIG.
+        expanded = _expand_env_vars(config)
+        config = apply_managed_overlay(
+            expanded if isinstance(expanded, dict) else {}
         )
-
-        token = set_hermes_home_override(str(get_profile_dir(profile)))
-        try:
-            config = load_config_readonly()
-        finally:
-            reset_hermes_home_override(token)
-    else:
-        config = load_config_readonly()
+    except Exception:
+        logger.warning(
+            "Buzz: retaining last valid runtime authorization policy",
+            exc_info=True,
+        )
+        return _copy_authorization_policy(
+            _RUNTIME_AUTHORIZATION_POLICY_CACHE.get(cache_key, {})
+        )
     merged: Dict[str, Any] = {}
 
     def _merge(candidate: Any) -> None:
@@ -494,7 +530,10 @@ def _load_runtime_authorization_config(profile: Optional[str] = None) -> dict:
         ]
     if "allow_all_users" in merged:
         policy["allow_all_users"] = merged["allow_all_users"]
-    return policy
+    _RUNTIME_AUTHORIZATION_POLICY_CACHE[cache_key] = _copy_authorization_policy(
+        policy
+    )
+    return _copy_authorization_policy(policy)
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +604,31 @@ class BuzzAdapter(BasePlatformAdapter):
         ).strip().lower()
         self.transport = _transport if _transport in ("auto", "websocket", "poll") else "auto"
 
+        # Optional native Gateway activity observer. The owner pubkey is a
+        # routing/encryption setting (not a secret); an empty value keeps the
+        # observer disabled without changing normal Buzz chat delivery.
+        _activity_owner = str(extra.get("activity_owner_pubkey", "") or "").strip()
+        self.activity_owner_pubkey = (
+            _normalize_user_ref(_activity_owner) if _activity_owner else ""
+        )
+        if _activity_owner and not self.activity_owner_pubkey:
+            raise ValueError(
+                "Buzz activity_owner_pubkey must be a valid x-only secp256k1 "
+                "public key encoded as 64 hex characters or npub"
+            )
+        if self.activity_owner_pubkey:
+            try:
+                self.activity_owner_pubkey = (
+                    _load_nostr_auth().validate_x_only_public_key(
+                        self.activity_owner_pubkey
+                    )
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "Buzz activity_owner_pubkey must be a valid x-only "
+                    "secp256k1 public key encoded as 64 hex characters or npub"
+                ) from exc
+
         # Secret — resolved lazily (never at import/registration time and
         # never logged).  connect() re-resolves it to fail fast with a clear
         # error when it is missing.
@@ -580,6 +644,20 @@ class BuzzAdapter(BasePlatformAdapter):
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_ready: Optional[asyncio.Event] = None
         self._ws_active = False  # True while the WS loop owns inbound delivery
+        self._ws_connection: Any = None
+        self._activity_seq = 0
+        self._activity_ws_generation = 0
+        self._activity_pending_event_ids: OrderedDict[
+            str, tuple[int, asyncio.TimerHandle]
+        ] = OrderedDict()
+        self._activity_pending_terminal_payloads: OrderedDict[
+            str, Dict[str, Any]
+        ] = OrderedDict()
+        self._activity_queue: asyncio.Queue = asyncio.Queue(maxsize=_ACTIVITY_QUEUE_SIZE)
+        self._activity_sender_task: Optional[asyncio.Task] = None
+        self._activity_terminal_replay: OrderedDict[str, Dict[str, Any]] = (
+            OrderedDict()
+        )
         self._membership_since = 0
         self._lock_key: Optional[str] = None
         # channel_id -> {"chat_type", "last_ts", "seen": OrderedDict[event_id, None]}
@@ -740,6 +818,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 pass
             self._lock_key = None
         self._ws_active = False
+        self._ws_connection = None
         if self._ws_task and not self._ws_task.done():
             self._ws_task.cancel()
             try:
@@ -747,6 +826,7 @@ class BuzzAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
         self._ws_task = None
+        await self._reset_activity_transport()
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
             try:
@@ -906,6 +986,233 @@ class BuzzAdapter(BasePlatformAdapter):
         """Buzz has no typing indicator API — no-op."""
         pass
 
+    def _enqueue_activity(
+        self,
+        kind: str,
+        *,
+        channel_id: Optional[str],
+        session_id: Optional[str],
+        turn_id: Optional[str],
+        payload: Optional[Dict[str, Any]] = None,
+        started_at: Optional[str] = None,
+    ) -> bool:
+        """Non-blocking, fail-open enqueue of one encrypted observer frame."""
+
+        if not self.activity_owner_pubkey:
+            return False
+        self._activity_seq += 1
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
+            "+00:00", "Z"
+        )
+        observer_payload: Dict[str, Any] = {
+            "seq": self._activity_seq,
+            "timestamp": timestamp,
+            "kind": str(kind),
+            "agentIndex": None,
+            "channelId": str(channel_id) if channel_id is not None else None,
+            "sessionId": str(session_id) if session_id is not None else None,
+            "turnId": str(turn_id) if turn_id is not None else None,
+            "payload": payload or {},
+        }
+        if started_at is not None:
+            observer_payload["startedAt"] = str(started_at)
+        websocket = self._ws_connection
+        if not self._ws_active or websocket is None:
+            return self._cache_terminal_activity(observer_payload)
+        try:
+            self._activity_queue.put_nowait(
+                (self._activity_ws_generation, observer_payload)
+            )
+        except asyncio.QueueFull:
+            if self._cache_terminal_activity(observer_payload):
+                return True
+            logger.debug("Buzz: observer activity queue full; dropping frame")
+            return False
+        if self._activity_sender_task is None or self._activity_sender_task.done():
+            self._activity_sender_task = asyncio.create_task(self._activity_sender_loop())
+        return True
+
+    def _cache_terminal_activity(self, observer_payload: Dict[str, Any]) -> bool:
+        """Retain only the latest terminal frame per turn across reconnects."""
+
+        if str(observer_payload.get("kind") or "") not in _ACTIVITY_TERMINAL_KINDS:
+            return False
+        replay_key = str(
+            observer_payload.get("turnId")
+            or observer_payload.get("sessionId")
+            or observer_payload.get("seq")
+        )
+        self._activity_terminal_replay[replay_key] = observer_payload
+        self._activity_terminal_replay.move_to_end(replay_key)
+        while len(self._activity_terminal_replay) > _ACTIVITY_TERMINAL_REPLAY_CAP:
+            self._activity_terminal_replay.popitem(last=False)
+        return True
+
+    def _replay_terminal_activity(self) -> None:
+        """Move bounded terminal frames onto the current WebSocket generation."""
+
+        if not self._ws_active or self._ws_connection is None:
+            return
+        while self._activity_terminal_replay and not self._activity_queue.full():
+            _, observer_payload = self._activity_terminal_replay.popitem(last=False)
+            self._activity_queue.put_nowait(
+                (self._activity_ws_generation, observer_payload)
+            )
+        if (
+            not self._activity_queue.empty()
+            and (
+                self._activity_sender_task is None
+                or self._activity_sender_task.done()
+            )
+        ):
+            self._activity_sender_task = asyncio.create_task(
+                self._activity_sender_loop()
+            )
+
+    async def publish_activity(
+        self,
+        kind: str,
+        *,
+        channel_id: Optional[str],
+        session_id: Optional[str],
+        turn_id: Optional[str],
+        payload: Optional[Dict[str, Any]] = None,
+        started_at: Optional[str] = None,
+    ) -> bool:
+        """Compatibility wrapper for direct adapter callers and focused tests."""
+
+        return self._enqueue_activity(
+            kind,
+            channel_id=channel_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            payload=payload,
+            started_at=started_at,
+        )
+
+    def _drop_activity_ack(self, event_id: str) -> bool:
+        event_id = str(event_id)
+        pending = self._activity_pending_event_ids.pop(event_id, None)
+        self._activity_pending_terminal_payloads.pop(event_id, None)
+        if pending is None:
+            return False
+        pending[1].cancel()
+        return True
+
+    def _expire_activity_ack(self, event_id: str, generation: int) -> None:
+        event_id = str(event_id)
+        pending = self._activity_pending_event_ids.get(event_id)
+        if pending is None or pending[0] != generation:
+            return
+        self._activity_pending_event_ids.pop(event_id, None)
+        self._activity_pending_terminal_payloads.pop(event_id, None)
+        logger.debug("Buzz: observer activity ACK timed out")
+
+    def _track_activity_ack(
+        self,
+        event_id: str,
+        generation: int,
+        observer_payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._drop_activity_ack(event_id)
+        handle = asyncio.get_running_loop().call_later(
+            _ACTIVITY_ACK_TIMEOUT,
+            self._expire_activity_ack,
+            str(event_id),
+            generation,
+        )
+        event_id = str(event_id)
+        self._activity_pending_event_ids[event_id] = (generation, handle)
+        self._activity_pending_event_ids.move_to_end(event_id)
+        if (
+            observer_payload is not None
+            and str(observer_payload.get("kind") or "")
+            in _ACTIVITY_TERMINAL_KINDS
+        ):
+            self._activity_pending_terminal_payloads[event_id] = observer_payload
+            self._activity_pending_terminal_payloads.move_to_end(event_id)
+        while len(self._activity_pending_event_ids) > _ACTIVITY_PENDING_CAP:
+            evicted_id, (_, evicted_handle) = self._activity_pending_event_ids.popitem(
+                last=False
+            )
+            self._activity_pending_terminal_payloads.pop(evicted_id, None)
+            evicted_handle.cancel()
+
+    async def _activity_sender_loop(self) -> None:
+        """Encrypt and send queued observer frames without blocking Gateway turns."""
+        while True:
+            generation, observer_payload = await self._activity_queue.get()
+            event_id: Optional[str] = None
+            try:
+                websocket = self._ws_connection
+                if (
+                    not self._ws_active
+                    or websocket is None
+                    or generation != self._activity_ws_generation
+                ):
+                    self._cache_terminal_activity(observer_payload)
+                    continue
+                event = await asyncio.to_thread(
+                    _load_nostr_auth().build_observer_event,
+                    private_key=self._private_key,
+                    owner_pubkey=str(self.activity_owner_pubkey),
+                    payload=observer_payload,
+                )
+                if (
+                    not self._ws_active
+                    or websocket is not self._ws_connection
+                    or generation != self._activity_ws_generation
+                ):
+                    self._cache_terminal_activity(observer_payload)
+                    continue
+                event_id = str(event["id"])
+                # Track before send so a very fast relay OK cannot race ahead
+                # of correlation state installation.
+                self._track_activity_ack(event_id, generation, observer_payload)
+                raw = json.dumps(["EVENT", event], separators=(",", ":"))
+                await asyncio.wait_for(websocket.send(raw), timeout=_ACTIVITY_SEND_TIMEOUT)
+            except asyncio.CancelledError:
+                if event_id is not None:
+                    self._drop_activity_ack(event_id)
+                self._cache_terminal_activity(observer_payload)
+                raise
+            except Exception:
+                if event_id is not None:
+                    self._drop_activity_ack(event_id)
+                self._cache_terminal_activity(observer_payload)
+                logger.debug("Buzz: observer activity publication failed", exc_info=True)
+            finally:
+                self._activity_queue.task_done()
+                # If a terminal frame was retained because the queue was full
+                # or its old generation became stale, refill from the bounded
+                # replay cache as capacity becomes available.
+                self._replay_terminal_activity()
+
+    async def _reset_activity_transport(self) -> None:
+        """Invalidate one WebSocket generation and drop all of its activity."""
+        self._activity_ws_generation += 1
+        task = self._activity_sender_task
+        self._activity_sender_task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        while True:
+            try:
+                queued = self._activity_queue.get_nowait()
+                if isinstance(queued, tuple) and len(queued) == 2:
+                    self._cache_terminal_activity(queued[1])
+                self._activity_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+        for event_id in list(self._activity_pending_event_ids):
+            payload = self._activity_pending_terminal_payloads.get(event_id)
+            if payload is not None:
+                self._cache_terminal_activity(payload)
+            self._drop_activity_ack(event_id)
+
     async def send_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Add a reaction to a message via buzz-cli.
 
@@ -998,6 +1305,24 @@ class BuzzAdapter(BasePlatformAdapter):
         # Markdown renders in Buzz, so a URL arrives as a clickable image link.
         text = f"{caption}\n{image_url}" if caption else image_url
         return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Upload a local image through Buzz's native ``--file`` path."""
+        return await self.send_image(
+            chat_id=chat_id,
+            image_url=image_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         chat_id = str(chat_id)
@@ -1136,6 +1461,18 @@ class BuzzAdapter(BasePlatformAdapter):
             await self._send_channel_subscription(websocket, subscription_id, channel_id)
             logger.info("Buzz: subscribed to new conversation %s", channel_id)
 
+    def _handle_activity_ack(self, message: list) -> bool:
+        """Correlate an observer EVENT acknowledgment and surface rejection."""
+        if len(message) < 3 or message[0] != "OK":
+            return False
+        event_id = str(message[1])
+        if not self._drop_activity_ack(event_id):
+            return False
+        if message[2] is not True:
+            detail = str(message[3]) if len(message) > 3 else "relay rejected event"
+            logger.warning("Buzz: observer activity rejected by relay: %s", detail)
+        return True
+
     async def _websocket_loop(self) -> None:
         """Persistent authenticated subscription with bounded reconnect
         backoff. Events route through _handle_event() — identical semantics
@@ -1157,8 +1494,11 @@ class BuzzAdapter(BasePlatformAdapter):
                         max_size=_WS_MAX_MESSAGE_BYTES,
                     ) as websocket:
                         await self._authenticate_websocket(websocket)
+                        self._activity_ws_generation += 1
+                        self._ws_connection = websocket
                         subscriptions = await self._subscribe_websocket(websocket)
                         self._ws_active = True
+                        self._replay_terminal_activity()
                         if self._ws_ready is not None:
                             self._ws_ready.set()
                         backoff = 1.0
@@ -1183,20 +1523,29 @@ class BuzzAdapter(BasePlatformAdapter):
                                 if channel_id and state is not None:
                                     await self._handle_event(channel_id, state, event)
                                     self._trim_seen(state)
+                            elif message[0] == "OK":
+                                self._handle_activity_ack(message)
                             elif message[0] == "CLOSED":
                                 detail = message[-1] if len(message) > 2 else "subscription closed"
                                 raise ConnectionError(str(detail))
                             elif message[0] == "NOTICE":
                                 logger.warning("Buzz: relay notice: %s", message[-1])
+                    self._ws_active = False
+                    self._ws_connection = None
+                    await self._reset_activity_transport()
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
                     self._ws_active = False
+                    self._ws_connection = None
+                    await self._reset_activity_transport()
                     logger.warning("Buzz: WebSocket disconnected; retrying in %.1fs: %s", backoff, e)
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 30.0)
         finally:
             self._ws_active = False
+            self._ws_connection = None
+            await self._reset_activity_transport()
 
     # ── Inbound polling ───────────────────────────────────────────────────
 
@@ -1806,6 +2155,10 @@ class BuzzAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
 
+    def on_turn_lifecycle(self, event: Any) -> bool:
+        """Translate a neutral Gateway event into encrypted Buzz activity."""
+        return _handle_gateway_turn_lifecycle(event=event, route=self)
+
 
 # ---------------------------------------------------------------------------
 # Plugin registration
@@ -2060,6 +2413,80 @@ def interactive_setup() -> None:
     print()
     print_success("Buzz configuration saved to ~/.hermes/.env")
     print_info("Restart the gateway for changes to take effect: hermes gateway restart")
+
+
+def _handle_gateway_turn_lifecycle(*, event, route=None, **_kwargs):
+    """Translate neutral Gateway lifecycle metadata into Buzz observer frames."""
+
+    if not isinstance(route, BuzzAdapter) or not route.activity_owner_pubkey:
+        return False
+
+    phase = getattr(event, "phase", "")
+    payload: Dict[str, Any]
+    kind: str
+    if phase == "turn_started":
+        triggering_id = str(getattr(event, "triggering_event_id", "") or "")
+        payload = {
+            "source": "channel",
+            "triggeringEventIds": (
+                [triggering_id]
+                if re.fullmatch(r"[0-9a-fA-F]{64}", triggering_id)
+                else []
+            ),
+        }
+        kind = "turn_started"
+    elif phase == "session_resolved":
+        payload = {
+            "sessionId": str(getattr(event, "session_id", "") or ""),
+            "isNewSession": bool(getattr(event, "is_new_session", False)),
+        }
+        kind = "session_resolved"
+    elif phase == "turn_liveness":
+        payload = {}
+        kind = "turn_liveness"
+    elif phase in {"tool_started", "tool_finished"}:
+        status = str(getattr(event, "tool_status", "") or "")
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": str(getattr(event, "session_id", "") or ""),
+                "update": {
+                    "sessionUpdate": (
+                        "tool_call" if phase == "tool_started" else "tool_call_update"
+                    ),
+                    "toolCallId": str(getattr(event, "tool_call_id", "") or ""),
+                    "title": str(getattr(event, "tool_name", "") or ""),
+                    "toolName": str(getattr(event, "tool_name", "") or ""),
+                    "status": status,
+                    "rawInput": {},
+                },
+            },
+        }
+        kind = "acp_read"
+    elif phase == "turn_finished":
+        outcome = str(getattr(event, "outcome", None) or "failed")
+        if outcome == "success":
+            kind = "turn_completed"
+            payload = {}
+        else:
+            kind = "turn_error"
+            payload = {"status": outcome}
+    else:
+        return False
+
+    try:
+        return route._enqueue_activity(
+            kind,
+            channel_id=getattr(event, "channel_id", None),
+            session_id=getattr(event, "session_id", None),
+            turn_id=getattr(event, "turn_id", None),
+            started_at=getattr(event, "started_at", None),
+            payload=payload,
+        )
+    except Exception:
+        logger.debug("Buzz: Gateway lifecycle translation failed open", exc_info=True)
+        return False
 
 
 def register(ctx):

@@ -2436,6 +2436,7 @@ from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
+from gateway.turn_observer import GatewayTurnObserver
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
@@ -3780,9 +3781,15 @@ class TurnRunner:
     same module exactly as before.
     """
 
-    def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
+    def __init__(
+        self,
+        runner: "GatewayRunner",
+        ctx: TurnContext,
+        observer: GatewayTurnObserver,
+    ) -> None:
         self._runner = runner
         self._ctx = ctx
+        self._observer = observer
 
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
@@ -4399,6 +4406,46 @@ class TurnRunner:
             except Exception as e:
                 logger.error("Progress message error: %s", e)
                 await asyncio.sleep(1)
+
+    @staticmethod
+    def _compose_callbacks(existing, *callbacks):
+        """Compose structured callbacks with sibling failure isolation."""
+
+        if getattr(existing, "_gateway_turn_fanout", False):
+            existing = getattr(existing, "_gateway_prior_callback", None)
+        ordered = [callback for callback in (existing, *callbacks) if callable(callback)]
+        if not ordered:
+            return None
+
+        def fanout(*args, **kwargs):
+            for callback in ordered:
+                try:
+                    callback(*args, **kwargs)
+                except Exception:
+                    logger.debug("Structured tool callback failed open", exc_info=True)
+
+        fanout._gateway_turn_fanout = True
+        fanout._gateway_prior_callback = existing
+        return fanout
+
+    def wire_structured_tool_callbacks(self, agent) -> None:
+        """Compose generic observation and voice callbacks independently."""
+
+        # Wire observation before the turn starts. GatewayTurnObserver's
+        # callbacks self-gate on ``active``; checking that state here loses the
+        # callbacks because real construction wires them before start().
+        start_callbacks = [self._observer.tool_started]
+        if self._ctx._voice_ack_guild[0] is not None:
+            start_callbacks.append(self.voice_ack_callback)
+
+        agent.tool_start_callback = self._compose_callbacks(
+            getattr(agent, "tool_start_callback", None),
+            *start_callbacks,
+        )
+        agent.tool_complete_callback = self._compose_callbacks(
+            getattr(agent, "tool_complete_callback", None),
+            self._observer.tool_finished,
+        )
 
     def voice_ack_callback(self, call_id, tool_name, args):
         """tool_start_callback: speak a one-time ack in the voice channel."""
@@ -5019,11 +5066,10 @@ class TurnRunner:
             )
             else None
         )
-        # Discord voice verbal-ack hook (fires once per turn on first tool
-        # call; armed only when in a voice channel with the mixer running).
-        agent.tool_start_callback = (
-            ctx.voice_ack_callback if ctx._voice_ack_guild[0] is not None else None
-        )
+        # Structured callbacks feed optional activity telemetry and preserve the
+        # Discord voice verbal-ack hook. They are intentionally independent of
+        # the user-facing tool-progress setting.
+        self.wire_structured_tool_callbacks(agent)
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = _stream_delta_cb
         agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
@@ -18121,6 +18167,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                is_new_session=_is_new_session,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -19975,13 +20022,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # stale inspected content), not an attachment request.
             adapter.extract_images(cleaned)
 
+            _reply_anchor = self._reply_anchor_for_event(event)
             _thread_meta = (
                 dict(thread_metadata)
                 if thread_metadata is not None
-                else self._thread_metadata_for_source(
-                    event.source,
-                    self._reply_anchor_for_event(event),
-                )
+                else self._thread_metadata_for_source(event.source, _reply_anchor)
             )
 
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
@@ -20005,10 +20050,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(
+                    await adapter._send_multiple_images_with_routing(
                         chat_id=event.source.chat_id,
                         images=images,
                         metadata=_thread_meta,
+                        human_delay=0.0,
+                        reply_to=_reply_anchor,
                     )
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
@@ -24993,6 +25040,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        is_new_session: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -25012,6 +25060,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                is_new_session=is_new_session,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -25024,6 +25073,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                is_new_session=is_new_session,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -25146,6 +25196,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        is_new_session: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -25388,6 +25439,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         long_tool_hint_fired = [False]
         _LONG_TOOL_THRESHOLD_S = 30.0
 
+        turn_observer = GatewayTurnObserver(
+            platform=source.platform.value if source.platform else "",
+            profile=str(getattr(source, "profile", None) or ""),
+            channel_id=str(source.chat_id or ""),
+            session_id=str(session_id or ""),
+            triggering_event_id=event_message_id,
+            is_new_session=is_new_session,
+            route=self._adapter_for_source(source),
+            loop=asyncio.get_running_loop(),
+            is_current=_run_still_current,
+        )
+
         turn_ctx = TurnContext(
             source=source,
             _run_still_current=_run_still_current,
@@ -25431,7 +25494,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
         )
-        turn_runner = TurnRunner(self, turn_ctx)
+        turn_runner = TurnRunner(self, turn_ctx, turn_observer)
         # Callback invoked by agent on tool lifecycle events — extracted to
         # TurnRunner.progress_callback (bound method, same signature).
         turn_ctx.progress_callback = turn_runner.progress_callback
@@ -25973,7 +26036,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return False
             return False
 
+        response = None
+        _inactivity_timeout = False
         try:
+            # Start is a synchronous local dispatch/enqueue. It arms liveness
+            # before session resolution, and the protected region guarantees a
+            # terminal dispatch even if cancellation lands immediately.
+            turn_observer.start()
+            turn_observer.session_resolved()
+
             # Run in thread pool to not block.  Use an *inactivity*-based
             # timeout instead of a wall-clock limit: the agent can run for
             # hours if it's actively calling tools / receiving stream tokens,
@@ -26058,7 +26129,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._run_in_executor_with_context(_run_sync_with_timeout_lifecycle)
             )
 
-            _inactivity_timeout = False
             _POLL_INTERVAL = 5.0
 
             if _agent_timeout is None:
@@ -26635,6 +26705,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
+                # This logical turn ends before the queued follow-up begins.
+                # Finish now so observer ordering is start(A), terminal(A),
+                # start(B), terminal(B), rather than nesting active turns.
+                turn_observer.finish(response)
+
                 followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
@@ -26647,9 +26722,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    is_new_session=False,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
+            turn_observer.finish(
+                response,
+                timed_out=_inactivity_timeout,
+                exception_type=sys.exc_info()[0],
+            )
+
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:
                 progress_task.cancel()

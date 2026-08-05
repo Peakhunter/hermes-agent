@@ -87,8 +87,8 @@ def _make_adapter(extra=None):
     adapter._self_npub = SELF_NPUB
     adapter._display_name = "Chip"
     adapter._private_key = "nsec1test"
-    # Polling tests exercise routing and media behavior independently of the
-    # live authorization layer; security-specific tests override this gate.
+    # Polling/routing/media tests exercise behavior independently of cosmetic
+    # acknowledgement authorization. Security tests restore the real method.
     adapter._should_ack_sender = lambda *_args, **_kwargs: True
     return adapter
 
@@ -1121,6 +1121,7 @@ class TestAcknowledgementAuthorization:
             encoding="utf-8",
         )
         adapter = _make_adapter()
+        adapter._should_ack_sender = BuzzAdapter._should_ack_sender
         adapter._message_handler = AsyncMock()
         adapter.handle_message = AsyncMock()
         adapter.send_reaction = AsyncMock(return_value=True)
@@ -1151,6 +1152,7 @@ class TestAcknowledgementAuthorization:
             encoding="utf-8",
         )
         adapter = _make_adapter()
+        adapter._should_ack_sender = BuzzAdapter._should_ack_sender
         adapter._message_handler = AsyncMock()
         adapter.handle_message = AsyncMock()
         adapter.send_reaction = AsyncMock(return_value=True)
@@ -1178,6 +1180,7 @@ class TestAcknowledgementAuthorization:
             encoding="utf-8",
         )
         adapter = _make_adapter()
+        adapter._should_ack_sender = BuzzAdapter._should_ack_sender
         adapter._message_handler = AsyncMock()
         adapter.handle_message = AsyncMock()
         adapter.send_reaction = AsyncMock(return_value=True)
@@ -1205,6 +1208,7 @@ class TestAcknowledgementAuthorization:
             encoding="utf-8",
         )
         adapter = _make_adapter()
+        adapter._should_ack_sender = BuzzAdapter._should_ack_sender
         adapter._message_handler = AsyncMock()
         adapter.handle_message = AsyncMock()
         adapter.send_reaction = AsyncMock(return_value=True)
@@ -1233,6 +1237,7 @@ class TestAcknowledgementAuthorization:
             encoding="utf-8",
         )
         adapter = _make_adapter()
+        adapter._should_ack_sender = BuzzAdapter._should_ack_sender
         adapter._message_handler = AsyncMock()
         adapter.handle_message = AsyncMock()
         adapter.send_reaction = AsyncMock(return_value=True)
@@ -1262,6 +1267,7 @@ class TestAcknowledgementAuthorization:
             encoding="utf-8",
         )
         adapter = _make_adapter()
+        adapter._should_ack_sender = BuzzAdapter._should_ack_sender
         adapter._message_handler = AsyncMock()
         adapter.handle_message = AsyncMock()
         adapter.send_reaction = AsyncMock(return_value=True)
@@ -1289,6 +1295,7 @@ class TestAcknowledgementAuthorization:
         secret_scope.set_multiplex_active(True)
         try:
             adapter = _make_adapter()
+            adapter._should_ack_sender = BuzzAdapter._should_ack_sender
             adapter._message_handler = AsyncMock()
             adapter.handle_message = AsyncMock()
             adapter.send_reaction = AsyncMock(return_value=True)

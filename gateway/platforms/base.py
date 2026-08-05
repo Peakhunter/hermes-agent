@@ -3314,6 +3314,16 @@ class BasePlatformAdapter(ABC):
         """
         self._message_handler = handler
 
+    def on_turn_lifecycle(self, event: Any) -> bool:
+        """Consume a platform-neutral Gateway turn event when supported.
+
+        The default is deliberately a fail-open no-op. Concrete adapters may
+        translate the closed event contract into platform-native activity
+        telemetry without exposing adapter objects through the public hook or
+        outbound-webhook systems.
+        """
+        return False
+
     def set_topic_recovery_fn(
         self,
         fn: Optional[Callable[[Any], Optional[str]]],
@@ -3918,12 +3928,40 @@ class BasePlatformAdapter(ABC):
                 return
         await self.stop_typing(chat_id)
 
+    async def _send_multiple_images_with_routing(
+        self,
+        chat_id: str,
+        images: List[Tuple[str, str]],
+        metadata: Optional[Dict[str, Any]],
+        human_delay: float,
+        reply_to: Optional[str],
+    ) -> None:
+        """Pass reply routing when the concrete batch implementation supports it."""
+        kwargs: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "images": images,
+            "metadata": metadata,
+            "human_delay": human_delay,
+        }
+        try:
+            params = inspect.signature(self.send_multiple_images).parameters
+            accepts_reply_to = "reply_to" in params or any(
+                param.kind is inspect.Parameter.VAR_KEYWORD
+                for param in params.values()
+            )
+        except (TypeError, ValueError):
+            accepts_reply_to = False
+        if accepts_reply_to:
+            kwargs["reply_to"] = reply_to
+        await self.send_multiple_images(**kwargs)
+
     async def send_multiple_images(
         self,
         chat_id: str,
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
+        reply_to: Optional[str] = None,
     ) -> None:
         """Send a batch of images.
 
@@ -3954,6 +3992,7 @@ class BasePlatformAdapter(ABC):
                         chat_id=chat_id,
                         image_path=_unquote(image_url[7:]),
                         caption=alt_text if alt_text else None,
+                        reply_to=reply_to,
                         metadata=metadata,
                     )
                 elif self._is_animation_url(image_url):
@@ -3961,6 +4000,7 @@ class BasePlatformAdapter(ABC):
                         chat_id=chat_id,
                         animation_url=image_url,
                         caption=alt_text if alt_text else None,
+                        reply_to=reply_to,
                         metadata=metadata,
                     )
                 else:
@@ -3968,6 +4008,7 @@ class BasePlatformAdapter(ABC):
                         chat_id=chat_id,
                         image_url=image_url,
                         caption=alt_text if alt_text else None,
+                        reply_to=reply_to,
                         metadata=metadata,
                     )
                 if not img_result.success:
@@ -6150,11 +6191,12 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        await self.send_multiple_images(
+                        await self._send_multiple_images_with_routing(
                             chat_id=event.source.chat_id,
                             images=images,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
+                            reply_to=_reply_anchor_for_event(event),
                         )
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
@@ -6192,11 +6234,12 @@ class BasePlatformAdapter(ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        await self._send_multiple_images_with_routing(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
+                            reply_to=_reply_anchor_for_event(event),
                         )
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)

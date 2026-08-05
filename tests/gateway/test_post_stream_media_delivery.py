@@ -38,10 +38,10 @@ def _event():
     )
 
 
-def _fake_runner(thread_meta):
+def _fake_runner(thread_meta, reply_anchor=None):
     return SimpleNamespace(
         _thread_metadata_for_source=lambda source, anchor=None: thread_meta,
-        _reply_anchor_for_event=lambda event: None,
+        _reply_anchor_for_event=lambda event: reply_anchor,
     )
 
 
@@ -56,6 +56,7 @@ def _adapter():
         send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="image")),
         send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
         send_multiple_images=AsyncMock(return_value=SendResult(success=True, message_id="imgs")),
+        _send_multiple_images_with_routing=AsyncMock(),
     )
 
 
@@ -105,9 +106,30 @@ async def test_explicit_media_tag_still_delivers_post_stream(tmp_path, monkeypat
         adapter,
     )
 
-    adapter.send_multiple_images.assert_awaited_once()
-    images_kwargs = adapter.send_multiple_images.await_args.kwargs
+    adapter._send_multiple_images_with_routing.assert_awaited_once()
+    images_kwargs = adapter._send_multiple_images_with_routing.await_args.kwargs
     assert images_kwargs["chat_id"] == "C123CHAN"
     assert str(media_file) in images_kwargs["images"][0][0]
+    adapter.send_multiple_images.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_stream_image_preserves_root_reply_anchor(tmp_path, monkeypatch):
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "threaded-chart.png")
+    adapter = _adapter()
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner(None, reply_anchor="triggering-root-message"),
+        f"MEDIA:{media_file}",
+        _event(),
+        adapter,
+    )
+
+    adapter._send_multiple_images_with_routing.assert_awaited_once()
+    images_kwargs = adapter._send_multiple_images_with_routing.await_args.kwargs
+    assert images_kwargs["reply_to"] == "triggering-root-message"
+    assert images_kwargs["metadata"] is None
+    assert str(media_file) in images_kwargs["images"][0][0]
+    adapter.send_multiple_images.assert_not_awaited()
 
 

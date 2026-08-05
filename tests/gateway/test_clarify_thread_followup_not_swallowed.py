@@ -290,5 +290,3 @@ async def test_untagged_buzz_dm_reply_resolves_session_scoped_clarify():
     assert entry.event.is_set()
     assert entry.response == "Continue in this DM"
     _clear_clarify_state()
-
-

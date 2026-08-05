@@ -2124,5 +2124,3 @@ class TestStandaloneSend:
         assert result == {"success": True, "message_id": "evt-cron"}
         assert [text for _args, text in calls] == ["Cron asks @ghost", "Cron asks ghost"]
         assert calls[1][0] == calls[0][0]
-
-

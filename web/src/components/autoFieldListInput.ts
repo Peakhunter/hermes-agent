@@ -13,6 +13,35 @@ export function compactListInput(value: unknown): string[] {
     .filter(Boolean);
 }
 
+export function normalizeListFieldValue(value: unknown): unknown[] | null {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") return compactListInput(parseListInput(value));
+  return null;
+}
+
+function normalizeListAtPath(value: unknown, path: string[]): unknown {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
+  const [key, ...rest] = path;
+  if (!key || !(key in value)) return value;
+
+  const record = value as Record<string, unknown>;
+  if (rest.length === 0) {
+    if (typeof record[key] !== "string") return value;
+    return { ...record, [key]: normalizeListFieldValue(record[key]) ?? [] };
+  }
+
+  const normalizedChild = normalizeListAtPath(record[key], rest);
+  return normalizedChild === record[key] ? value : { ...record, [key]: normalizedChild };
+}
+
+export function normalizeBuzzAllowedUsersConfig(value: unknown): unknown {
+  const paths = [
+    ["gateway", "platforms", "buzz", "extra", "allowed_users"],
+    ["buzz", "extra", "allowed_users"],
+  ];
+  return paths.reduce((current, path) => normalizeListAtPath(current, path), value);
+}
+
 const BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 
 function bech32Polymod(values: number[]): number {
@@ -56,8 +85,9 @@ function isValidNpub(value: string): boolean {
 }
 
 export function validateBuzzAllowedUsers(value: unknown): string | null {
-  if (!Array.isArray(value)) return "Allowed Users must be a list.";
-  for (const [index, rawItem] of value.entries()) {
+  const normalized = normalizeListFieldValue(value);
+  if (!normalized) return "Allowed Users must be a list.";
+  for (const [index, rawItem] of normalized.entries()) {
     if (typeof rawItem !== "string") return "Each public key must be text.";
     const item = rawItem.trim();
     if (/\s/.test(item)) return "Separate public keys with commas.";

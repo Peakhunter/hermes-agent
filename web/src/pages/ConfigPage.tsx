@@ -41,7 +41,10 @@ import { getNestedValue, setNestedValue } from "@/lib/nested";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { Toast } from "@nous-research/ui/ui/components/toast";
 import { AutoField } from "@/components/AutoField";
-import { getBuzzAllowedUsersValidationError } from "@/components/autoFieldListInput";
+import {
+  getBuzzAllowedUsersValidationError,
+  normalizeBuzzAllowedUsersConfig,
+} from "@/components/autoFieldListInput";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { ListItem } from "@nous-research/ui/ui/components/list-item";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
@@ -53,6 +56,7 @@ import { useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
 import { BuzzIcon } from "@/components/BuzzIcon";
+import { configSectionLabel } from "./configFieldPresentation";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -281,14 +285,16 @@ export default function ConfigPage() {
   /* ---- Handlers ---- */
   const handleSave = async () => {
     if (!config) return;
-    const buzzValidationError = getBuzzAllowedUsersValidationError(config);
+    const normalizedConfig = normalizeBuzzAllowedUsersConfig(config) as Record<string, unknown>;
+    const buzzValidationError = getBuzzAllowedUsersValidationError(normalizedConfig);
     if (buzzValidationError) {
       showToast(`${t.config.failedToSave}: ${buzzValidationError}`, "error");
       return;
     }
+    setConfig(normalizedConfig);
     setSaving(true);
     try {
-      await api.saveConfig(config);
+      await api.saveConfig(normalizedConfig);
       showToast(t.config.configSaved, "success");
     } catch (e) {
       showToast(`${t.config.failedToSave}: ${e}`, "error");
@@ -394,10 +400,11 @@ export default function ConfigPage() {
       const parts = key.split(".");
       const section = parts.length > 1 ? parts[0] : "";
       const cat = String(s.category ?? "general");
+      const sectionLabel = configSectionLabel(section, cat);
       const showCatBadge = showCategory && cat !== lastCat;
       const showSection =
         !showCategory &&
-        section &&
+        sectionLabel &&
         section !== lastSection &&
         section !== activeCategory;
       lastSection = section;
@@ -420,7 +427,7 @@ export default function ConfigPage() {
           {showSection && (
             <div className="flex items-center gap-2 pt-4 pb-2 first:pt-0">
               <span className="font-mondwest text-display text-xs font-semibold tracking-wider text-muted-foreground">
-                {section.replace(/_/g, " ")}
+                {sectionLabel}
               </span>
               <div className="flex-1 border-t border-border" />
             </div>

@@ -8,7 +8,10 @@ import {
   updateListInputDraft,
   validateBuzzAllowedUsers,
   getBuzzAllowedUsersValidationError,
+  normalizeBuzzAllowedUsersConfig,
+  normalizeListFieldValue,
 } from "./autoFieldListInput";
+import { configSectionLabel } from "../pages/configFieldPresentation";
 
 describe("AutoField", () => {
   it("gives generated boolean switches an accessible name", () => {
@@ -67,6 +70,28 @@ describe("AutoField", () => {
         "npub1nl2u0wnd8mezfknc74q7pl9ec58h9nrrakce4tnk434qgaxl4psqe5twr6",
       ]),
     ).toBeNull();
+  });
+
+  it("accepts a legacy scalar as one Buzz allowed-user entry", () => {
+    const key = "a".repeat(64);
+    expect(normalizeListFieldValue(key)).toEqual([key]);
+    expect(validateBuzzAllowedUsers(key)).toBeNull();
+    expect(normalizeListFieldValue("")).toEqual([]);
+    expect(validateBuzzAllowedUsers("")).toBeNull();
+  });
+
+  it("normalizes canonical and legacy scalar Buzz users before save", () => {
+    const key = "a".repeat(64);
+    const original = {
+      gateway: { platforms: { buzz: { extra: { allowed_users: key } } } },
+      buzz: { extra: { allowed_users: "" } },
+    };
+
+    expect(normalizeBuzzAllowedUsersConfig(original)).toEqual({
+      gateway: { platforms: { buzz: { extra: { allowed_users: [key] } } } },
+      buzz: { extra: { allowed_users: [] } },
+    });
+    expect(original.gateway.platforms.buzz.extra.allowed_users).toBe(key);
   });
 
   it("rejects npubs with a bad checksum", () => {
@@ -146,17 +171,28 @@ describe("AutoField", () => {
     expect(markup).toContain('aria-label="Allow All Users"');
   });
 
-  it("names the generated Buzz allowed-users list", () => {
+  it("renders a legacy scalar Buzz user without raw path or list error", () => {
     const markup = renderToStaticMarkup(
       <AutoField
         schemaKey="gateway.platforms.buzz.extra.allowed_users"
-        schema={{ type: "list" }}
-        value={[]}
+        schema={{
+          type: "list",
+          description: "Public Nostr npubs or hex pubkeys allowed to send inbound instructions",
+        }}
+        value={"a".repeat(64)}
         onChange={() => undefined}
       />,
     );
 
     expect(markup).toContain('aria-label="Allowed Users"');
     expect(markup).toContain('placeholder="comma-separated values"');
+    expect(markup).not.toContain("Allowed Users must be a list.");
+    expect(markup).not.toContain("gateway.platforms.buzz.extra.allowed_users");
+    expect(markup).not.toContain('role="alert"');
+  });
+
+  it("does not label the dedicated Buzz category as gateway", () => {
+    expect(configSectionLabel("gateway", "buzz")).toBeNull();
+    expect(configSectionLabel("model_settings", "general")).toBe("model settings");
   });
 });

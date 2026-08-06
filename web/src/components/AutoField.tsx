@@ -5,10 +5,14 @@ import { Switch } from "@nous-research/ui/ui/components/switch";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { Label } from "@nous-research/ui/ui/components/label";
 
-import { updateListInputDraft, validateBuzzAllowedUsers } from "./autoFieldListInput";
+import {
+  updateListInputDraft,
+  validateBuzzAllowedUsers,
+} from "./autoFieldListInput";
 
 function FieldHint({ schema, schemaKey }: { schema: Record<string, unknown>; schemaKey: string }) {
-  const keyPath = schemaKey.includes(".") ? schemaKey : "";
+  const isDedicatedBuzzField = schemaKey.startsWith("gateway.platforms.buzz.extra.");
+  const keyPath = schemaKey.includes(".") && !isDedicatedBuzzField ? schemaKey : "";
   const description = schema.description ? String(schema.description) : "";
 
   if (!keyPath && !description) return null;

@@ -2103,6 +2103,34 @@ class TestConfigRoundTrip:
         self.client = TestClient(app)
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
+    def test_buzz_canonical_save_removes_only_legacy_access_overrides(self):
+        from hermes_cli.config import load_config, read_raw_config, save_config
+
+        save_config({
+            "buzz": {
+                "extra": {
+                    "allowed_users": ["a" * 64],
+                    "allow_all_users": True,
+                    "require_mention": False,
+                },
+            },
+        })
+
+        web_config = self.client.get("/api/config").json()
+        canonical = web_config["gateway"]["platforms"]["buzz"]["extra"]
+        canonical["allowed_users"] = ["b" * 64]
+        canonical["allow_all_users"] = False
+
+        response = self.client.put("/api/config", json={"config": web_config})
+        assert response.status_code == 200
+
+        raw = read_raw_config()
+        raw_canonical = raw["gateway"]["platforms"]["buzz"]["extra"]
+        assert raw_canonical["allowed_users"] == ["b" * 64]
+        effective = load_config()["gateway"]["platforms"]["buzz"]["extra"]
+        assert effective["allow_all_users"] is False
+        assert raw["buzz"]["extra"] == {"require_mention": False}
+
 
 
 

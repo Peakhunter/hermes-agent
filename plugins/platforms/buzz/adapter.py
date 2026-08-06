@@ -1888,10 +1888,42 @@ class BuzzAdapter(BasePlatformAdapter):
             if signature == self._mention_config_signature:
                 return
             raw = read_user_config_raw(path)
-            buzz = raw.get("buzz", {}) if isinstance(raw, dict) else {}
-            extra = buzz.get("extra", buzz) if isinstance(buzz, dict) else {}
-            if not isinstance(extra, dict):
-                extra = {}
+            extra: Dict[str, Any] = {}
+
+            def _merge(candidate: Any) -> None:
+                if not isinstance(candidate, dict):
+                    return
+                extra.update(
+                    {
+                        key: value
+                        for key, value in candidate.items()
+                        if key
+                        not in {
+                            "enabled",
+                            "token",
+                            "home_channel",
+                            "home_channels",
+                            "extra",
+                        }
+                    }
+                )
+                nested = candidate.get("extra")
+                if isinstance(nested, dict):
+                    extra.update(nested)
+
+            if isinstance(raw, dict):
+                gateway = raw.get("gateway")
+                gateway_platforms = (
+                    gateway.get("platforms") if isinstance(gateway, dict) else None
+                )
+                if isinstance(gateway_platforms, dict):
+                    _merge(gateway_platforms.get("buzz"))
+                platforms = raw.get("platforms")
+                if isinstance(platforms, dict):
+                    _merge(platforms.get("buzz"))
+                if isinstance(gateway, dict):
+                    _merge(gateway.get("buzz"))
+                _merge(raw.get("buzz"))
 
             for key, env_name, attr in (
                 ("require_mention", "BUZZ_REQUIRE_MENTION", "require_mention"),

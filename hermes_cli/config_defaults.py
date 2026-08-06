@@ -1964,17 +1964,6 @@ DEFAULT_CONFIG = {
         "channel_prompts": {},         # Per-channel ephemeral system prompts
     },
 
-    # Buzz platform settings (gateway mode). These live under ``extra``
-    # because the plugin adapter consumes PlatformConfig.extra.
-    "buzz": {
-        "extra": {
-            "allowed_users": [],           # Public Nostr npubs or hex pubkeys
-            "allow_all_users": False,      # Secure default: deny unlisted senders
-            "require_mention": True,        # Require @mention in shared channels
-            "thread_require_mention": True,  # Preserve strict historical behavior by default
-        },
-    },
-
     # Discord platform settings (gateway mode)
     "discord": {
         "require_mention": True,       # Require @mention to respond in server channels
@@ -2553,6 +2542,10 @@ DEFAULT_CONFIG = {
                     "allowed_users": [],
                     # Secure default: do not admit every community member implicitly.
                     "allow_all_users": False,
+                    # Require @mention in shared channels.
+                    "require_mention": True,
+                    # Preserve strict historical behavior for thread replies.
+                    "thread_require_mention": True,
                 },
             },
         },

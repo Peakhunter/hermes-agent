@@ -852,11 +852,11 @@ def _timezone_options() -> List[str]:
 
 
 _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
-    "buzz.extra.require_mention": {
+    "gateway.platforms.buzz.extra.require_mention": {
         "category": "buzz",
         "description": "Require Mention",
     },
-    "buzz.extra.thread_require_mention": {
+    "gateway.platforms.buzz.extra.thread_require_mention": {
         "category": "buzz",
         "description": "Require Mention in Active Threads",
     },
@@ -7055,7 +7055,12 @@ def _remove_shadowed_legacy_buzz_access(
     if not isinstance(canonical_extra, dict):
         return
 
-    supplied = {"allowed_users", "allow_all_users"}.intersection(canonical_extra)
+    supplied = {
+        "allowed_users",
+        "allow_all_users",
+        "require_mention",
+        "thread_require_mention",
+    }.intersection(canonical_extra)
     if not supplied:
         return
 

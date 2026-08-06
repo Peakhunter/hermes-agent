@@ -447,6 +447,36 @@ class TestPollingDedupe:
 
 class TestMentionGating:
 
+    def test_live_refresh_reads_canonical_dashboard_controls(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("BUZZ_REQUIRE_MENTION", raising=False)
+        monkeypatch.delenv("BUZZ_THREAD_REQUIRE_MENTION", raising=False)
+        monkeypatch.delenv(
+            "_HERMES_YAML_BRIDGE_BUZZ_REQUIRE_MENTION", raising=False
+        )
+        monkeypatch.delenv(
+            "_HERMES_YAML_BRIDGE_BUZZ_THREAD_REQUIRE_MENTION", raising=False
+        )
+        (tmp_path / "config.yaml").write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    buzz:\n"
+            "      extra:\n"
+            "        require_mention: false\n"
+            "        thread_require_mention: false\n",
+            encoding="utf-8",
+        )
+        adapter = _make_adapter(
+            {"require_mention": True, "thread_require_mention": True}
+        )
+
+        adapter._refresh_mention_policy()
+
+        assert adapter.require_mention is False
+        assert adapter.thread_require_mention is False
+
     @pytest.fixture
     def adapter(self):
         a = _make_adapter()

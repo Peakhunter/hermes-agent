@@ -116,8 +116,7 @@ export function getBuzzAllowedUsersValidationError(config: unknown): string | nu
       current = (current as Record<string, unknown>)[key];
     }
     if (found) {
-      const error = validateBuzzAllowedUsers(current);
-      if (error) return error;
+      return validateBuzzAllowedUsers(current);
     }
   }
   return null;

@@ -87,10 +87,12 @@ describe("AutoField", () => {
       buzz: { extra: { allowed_users: "legacy-invalid-scalar" } },
     };
 
-    expect(normalizeBuzzAllowedUsersConfig(original)).toEqual({
+    const normalized = normalizeBuzzAllowedUsersConfig(original);
+    expect(normalized).toEqual({
       gateway: { platforms: { buzz: { extra: { allowed_users: [key] } } } },
       buzz: { extra: { allowed_users: "legacy-invalid-scalar" } },
     });
+    expect(getBuzzAllowedUsersValidationError(normalized)).toBeNull();
     expect(original.gateway.platforms.buzz.extra.allowed_users).toBe(key);
   });
 

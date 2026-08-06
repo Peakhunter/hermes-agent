@@ -7012,6 +7012,38 @@ def _validate_buzz_allowed_users(config: Dict[str, Any]) -> None:
                     )
 
 
+def _config_extra_at(config: Dict[str, Any], *path: str) -> Optional[Dict[str, Any]]:
+    current: Any = config
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current if isinstance(current, dict) else None
+
+
+def _validation_config_for_buzz_access(
+    existing: Dict[str, Any], incoming: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Ignore unchanged legacy access values superseded by canonical input."""
+    validation = _deep_merge({}, incoming)
+    canonical = _config_extra_at(incoming, "gateway", "platforms", "buzz", "extra")
+    old_legacy = _config_extra_at(existing, "buzz", "extra")
+    new_legacy = _config_extra_at(incoming, "buzz", "extra")
+    validation_legacy = _config_extra_at(validation, "buzz", "extra")
+    if (
+        canonical is None
+        or old_legacy is None
+        or new_legacy is None
+        or validation_legacy is None
+    ):
+        return validation
+
+    for key in {"allowed_users", "allow_all_users"}.intersection(canonical):
+        if key in new_legacy and key in old_legacy and new_legacy[key] == old_legacy[key]:
+            validation_legacy.pop(key, None)
+    return validation
+
+
 def _remove_shadowed_legacy_buzz_access(
     merged: Dict[str, Any], incoming: Dict[str, Any]
 ) -> None:
@@ -7054,9 +7086,11 @@ async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
             with _CONFIG_MUTATION_LOCK:
                 existing = read_raw_config()
                 incoming = _denormalize_config_from_web(body.config)
-                _validate_buzz_allowed_users(incoming)
+                validation_config = _validation_config_for_buzz_access(existing, incoming)
+                _validate_buzz_allowed_users(validation_config)
                 merged = _deep_merge(existing, incoming)
                 _remove_shadowed_legacy_buzz_access(merged, incoming)
+                _validate_buzz_allowed_users(merged)
                 save_config(merged)
         return {"ok": True}
 

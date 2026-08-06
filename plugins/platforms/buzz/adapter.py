@@ -78,6 +78,16 @@ def _get_scoped_secret(name, default=None):
     return val if val is not None else default
 
 
+def _profile_scoped_config_load() -> bool:
+    """Return whether config is loading inside a multiplex profile scope."""
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+        return bool(is_multiplex_active() and current_secret_scope() is not None)
+    except Exception:
+        return False
+
+
 logger = logging.getLogger(__name__)
 
 from gateway.platforms.base import (
@@ -2315,9 +2325,33 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
     config.yaml update.  ``BUZZ_PRIVATE_KEY`` is a secret and stays in ``.env``;
     it is never sourced from config.yaml here.
     """
-    extra = buzz_cfg.get("extra", buzz_cfg) or {}
-    if not isinstance(extra, dict):
+    merged_extra: dict = {}
+
+    def _merge_extra(candidate: Any) -> None:
+        if not isinstance(candidate, dict):
+            return
+        candidate_extra = candidate.get("extra", candidate) or {}
+        if isinstance(candidate_extra, dict):
+            merged_extra.update(candidate_extra)
+
+    # Match gateway-loader precedence while retaining unrelated legacy values.
+    platforms_cfg = yaml_cfg.get("platforms")
+    if isinstance(platforms_cfg, dict):
+        _merge_extra(platforms_cfg.get("buzz"))
+    gateway_cfg = yaml_cfg.get("gateway")
+    if isinstance(gateway_cfg, dict):
+        gateway_platforms = gateway_cfg.get("platforms")
+        if isinstance(gateway_platforms, dict):
+            _merge_extra(gateway_platforms.get("buzz"))
+    _merge_extra(yaml_cfg.get("buzz"))
+    _merge_extra(buzz_cfg)
+
+    extra = merged_extra
+    if not extra:
         return None
+    if _profile_scoped_config_load():
+        # Keep profile YAML out of process-global env under multiplexing.
+        return extra
     _str_keys = {
         "relay_url": "BUZZ_RELAY_URL",
         "cli_path": "BUZZ_CLI_PATH",

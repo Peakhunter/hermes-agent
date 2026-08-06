@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import os
 from pathlib import Path
 import stat
 import sys
@@ -340,6 +341,39 @@ class TestBuzzAdapterInit:
         assert _buzz_mod._load_runtime_authorization_config("secondary") == {
             "allowed_users": [SELF_PUBKEY]
         }
+
+    def test_scoped_gateway_loader_seeds_legacy_extra(self, monkeypatch, tmp_path):
+        from agent import secret_scope as ss
+        from gateway.config import Platform, load_gateway_config
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "buzz:\n"
+            "  extra:\n"
+            "    relay_url: https://profile.relay\n"
+            f"    allowed_users:\n      - {SELF_NPUB}\n"
+            "    allow_all_users: false\n"
+            "    require_mention: false\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({})
+        try:
+            config = load_gateway_config()
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+
+        buzz = config.platforms[Platform("buzz")]
+        assert buzz.extra["relay_url"] == "https://profile.relay"
+        assert buzz.extra["allowed_users"] == [SELF_NPUB]
+        assert buzz.extra["allow_all_users"] is False
+        assert buzz.extra["require_mention"] is False
+        assert "BUZZ_RELAY_URL" not in os.environ
+        assert "BUZZ_ALLOWED_USERS" not in os.environ
+        assert "BUZZ_ALLOW_ALL_USERS" not in os.environ
 
 
 # ── CLI error contract ────────────────────────────────────────────────────

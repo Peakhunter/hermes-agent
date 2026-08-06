@@ -35,11 +35,13 @@ function normalizeListAtPath(value: unknown, path: string[]): unknown {
 }
 
 export function normalizeBuzzAllowedUsersConfig(value: unknown): unknown {
-  const paths = [
-    ["gateway", "platforms", "buzz", "extra", "allowed_users"],
-    ["buzz", "extra", "allowed_users"],
-  ];
-  return paths.reduce((current, path) => normalizeListAtPath(current, path), value);
+  return normalizeListAtPath(value, [
+    "gateway",
+    "platforms",
+    "buzz",
+    "extra",
+    "allowed_users",
+  ]);
 }
 
 const BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";

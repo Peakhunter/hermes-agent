@@ -80,16 +80,16 @@ describe("AutoField", () => {
     expect(validateBuzzAllowedUsers("")).toBeNull();
   });
 
-  it("normalizes canonical and legacy scalar Buzz users before save", () => {
+  it("normalizes canonical scalar Buzz users before save without rewriting legacy data", () => {
     const key = "a".repeat(64);
     const original = {
       gateway: { platforms: { buzz: { extra: { allowed_users: key } } } },
-      buzz: { extra: { allowed_users: "" } },
+      buzz: { extra: { allowed_users: "legacy-invalid-scalar" } },
     };
 
     expect(normalizeBuzzAllowedUsersConfig(original)).toEqual({
       gateway: { platforms: { buzz: { extra: { allowed_users: [key] } } } },
-      buzz: { extra: { allowed_users: [] } },
+      buzz: { extra: { allowed_users: "legacy-invalid-scalar" } },
     });
     expect(original.gateway.platforms.buzz.extra.allowed_users).toBe(key);
   });

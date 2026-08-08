@@ -1063,6 +1063,8 @@ platform_toolsets:
 #         allow_all_users: false     # Secure default: deny unlisted senders
 #         require_mention: true       # Require @mention in shared channels
 #         thread_require_mention: true  # Require @mention in active threads
+#         outbound_mention_pubkeys:   # Exact routing for stable named handoffs
+#           CodexTerraM: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # Available toolsets (use these names in platform_toolsets or the toolsets list)

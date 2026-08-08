@@ -121,6 +121,7 @@ _BUZZ_IMAGE_MIME = {
     "bmp": "image/bmp",
 }
 _MAX_BUZZ_IMAGES_PER_MESSAGE = 4
+_BUZZ_MEDIA_RETRY_DELAYS = (0.25, 0.75)
 
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 # kind 44100 is Buzz's channel-membership event — used for live DM discovery.
@@ -468,6 +469,17 @@ def _cli_error_message(stderr: str, returncode: int) -> str:
     except ValueError:
         pass
     return text or f"buzz CLI failed with exit code {returncode}"
+
+
+def _cli_failure_is_retryable(stderr: str, returncode: int) -> bool:
+    """Honor the CLI error contract, with network/server exit-code fallback."""
+    try:
+        data = json.loads((stderr or "").strip())
+    except ValueError:
+        data = None
+    if isinstance(data, dict) and isinstance(data.get("retryable"), bool):
+        return data["retryable"]
+    return returncode in {2, 4}
 
 
 def _parse_json_list(stdout: str) -> List[dict]:
@@ -1952,12 +1964,23 @@ class BuzzAdapter(BasePlatformAdapter):
             )
             os.close(fd)
             try:
-                code, _out, _err = await self._run_cli(
-                    ["media", "get", url, "--output", temporary_path]
-                )
+                code = 4
+                _err = ""
+                attempts = 0
+                for delay in (0, *_BUZZ_MEDIA_RETRY_DELAYS):
+                    if delay:
+                        await asyncio.sleep(delay)
+                    attempts += 1
+                    code, _out, _err = await self._run_cli(
+                        ["media", "get", url, "--output", temporary_path]
+                    )
+                    if code == 0 or not _cli_failure_is_retryable(_err, code):
+                        break
                 if code != 0:
                     logger.warning(
-                        "Buzz: authenticated inbound image download failed (exit %d)",
+                        "Buzz: authenticated inbound image download failed "
+                        "after %d attempt(s) (exit %d)",
+                        attempts,
                         code,
                     )
                     continue

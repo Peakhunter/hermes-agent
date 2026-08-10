@@ -1071,7 +1071,12 @@ It builds the same system prompt the agent would, then breaks it down:
 - **Tool schemas** — the JSON for all enabled tools (the other half of the
   fixed per-call payload).
 
-Runs entirely offline — no API call, works with no credentials configured.
+Runs entirely offline — no API call, works with no credentials configured. After
+resolving `--platform`, it applies the same `agent.coding_context` selection as a
+live session, so focus-mode measurements reflect the reduced initial tool schema
+set. Run it from the same working directory and with the same
+profile/configuration as the session you plan to measure; project markers and
+coding-context settings can change the result.
 
 ```bash
 # Human-readable breakdown for the CLI platform (default)

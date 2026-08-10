@@ -79,7 +79,7 @@ _PROJECT_MARKERS = (
     "Cargo.toml", "go.mod", "pom.xml", "build.gradle", "build.gradle.kts",
     "Gemfile", "composer.json", "mix.exs", "pubspec.yaml",
     "CMakeLists.txt", "Makefile", "Dockerfile",
-    "AGENTS.md", "CLAUDE.md", ".cursorrules",
+    "AGENTS.md", "CLAUDE.md", ".cursorrules", ".hermes.md", "HERMES.md",
 )
 
 # Agent-instruction files surfaced separately from manifests in the snapshot.

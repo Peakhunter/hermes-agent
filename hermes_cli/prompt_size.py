@@ -61,14 +61,28 @@ def _build_inspection_agent(platform: str) -> Any:
     cfg = load_config()
     model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), dict) else {}
     model = model_cfg.get("default") or model_cfg.get("model") or ""
+    provider = model_cfg.get("provider") or None
 
     # Resolve platform-specific toolsets the same way the gateway does.
     enabled_toolsets = sorted(_get_platform_tools(cfg, platform))
     agent_cfg = cfg.get("agent") or {}
     disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
+    try:
+        from agent.coding_context import coding_selection
+
+        selected_toolsets = coding_selection(
+            platform=platform,
+            cwd=Path.cwd(),
+            config=cfg,
+        )
+        if selected_toolsets is not None:
+            enabled_toolsets = selected_toolsets
+    except Exception:
+        pass
 
     return AIAgent(
         model=model,
+        provider=provider,
         api_key="inspect-only",
         base_url="https://openrouter.ai/api/v1",
         quiet_mode=True,

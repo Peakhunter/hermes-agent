@@ -43,6 +43,114 @@ def isolated_home(tmp_path, monkeypatch):
     return hermes_home
 
 
+def test_inspection_agent_uses_coding_focus_toolsets(monkeypatch):
+    """Prompt-size must measure the focus toolsets selected by the real CLI."""
+    captured = {}
+
+    class FakeAIAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    cfg = {
+        "model": {"default": "test/model"},
+        "agent": {"coding_context": "focus"},
+    }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "run_agent",
+        SimpleNamespace(AIAgent=FakeAIAgent),
+    )
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_platform_tools",
+        lambda passed_cfg, platform: {"browser", "file", "terminal"},
+    )
+    def fake_coding_selection(*, platform=None, cwd=None, config=None):
+        assert platform == "cli"
+        assert cwd is not None
+        assert config is cfg
+        return ["coding", "figma"]
+
+    monkeypatch.setattr(
+        "agent.coding_context.coding_selection",
+        fake_coding_selection,
+    )
+
+    _build_inspection_agent("cli")
+
+    assert captured["enabled_toolsets"] == ["coding", "figma"]
+
+
+def test_inspection_agent_real_focus_preserves_enabled_mcp_servers(
+    tmp_path, monkeypatch
+):
+    """Real focus selection keeps enabled MCP and drops unrelated plugins."""
+    captured = {}
+
+    class FakeAIAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".hermes.md").write_text("# project context\n", encoding="utf-8")
+    cfg = {
+        "model": {"default": "test/model"},
+        "agent": {"coding_context": "focus"},
+        "mcp_servers": {"figma": {"enabled": True}},
+    }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "run_agent",
+        SimpleNamespace(AIAgent=FakeAIAgent),
+    )
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: cfg)
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_platform_tools",
+        lambda passed_cfg, platform: {"browser", "file", "plugin-demo"},
+    )
+    monkeypatch.chdir(workspace)
+
+    _build_inspection_agent("cli")
+
+    assert captured["enabled_toolsets"] == ["coding", "figma"]
+    assert "plugin-demo" not in captured["enabled_toolsets"]
+
+
+def test_inspection_agent_uses_configured_provider(monkeypatch):
+    """Prompt-size must include the provider metadata used by a real session."""
+    captured = {}
+
+    class FakeAIAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    cfg = {
+        "model": {
+            "default": "test-model",
+            "provider": "openai-codex",
+        },
+    }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "run_agent",
+        SimpleNamespace(AIAgent=FakeAIAgent),
+    )
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_platform_tools",
+        lambda passed_cfg, platform: {"file", "terminal"},
+    )
+
+    _build_inspection_agent("cli")
+
+    assert captured["provider"] == "openai-codex"
+
+
 
 
 def test_runs_offline_without_credentials(isolated_home, monkeypatch):

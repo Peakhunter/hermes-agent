@@ -1825,9 +1825,18 @@ class BuzzAdapter(BasePlatformAdapter):
             return
 
         # Reject unauthorized senders before any authenticated media fetch or
-        # profile lookup. This mirrors the gateway's live authorization policy
-        # while keeping protected relay resources inaccessible to rejected input.
-        if not self._should_ack_sender(pubkey):
+        # profile lookup. Prefer the gateway-supplied callback because it owns
+        # the complete live authorization union (platform/global allowlists,
+        # pairing, and the adapter's multiplex profile). Standalone/test adapters
+        # without that callback retain the local Buzz-policy fallback.
+        authorized = self._is_sender_authorized(
+            pubkey,
+            state.get("chat_type"),
+            channel_id,
+        )
+        if authorized is False or (
+            authorized is None and not self._should_ack_sender(pubkey)
+        ):
             return
 
         # Reclassify a leaked DM before gating so its first un-mentioned

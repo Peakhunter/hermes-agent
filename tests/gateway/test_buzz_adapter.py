@@ -1240,9 +1240,16 @@ class TestMentionGating:
 
 
     @pytest.mark.asyncio
-    async def test_access_policy_is_deferred_to_central_authorization(self, adapter):
-        adapter._allowed_pubkeys = {"b" * 64}
-        await self._poll_with(adapter, _event("e1", content="@Chip hello", created_at=10))
+    async def test_central_authorization_grant_controls_intake(self, adapter):
+        adapter._should_ack_sender = lambda *_args, **_kwargs: False
+        adapter.set_authorization_check(
+            lambda user_id, chat_type=None, chat_id=None: user_id == OTHER_PUBKEY
+        )
+
+        await self._poll_with(
+            adapter, _event("e1", content="@Chip hello", created_at=10)
+        )
+
         assert [item["message_id"] for item in adapter._dispatched] == ["e1"]
 
 

@@ -1598,6 +1598,104 @@ class TestDmClassification:
 
 
 class TestChannelDiscovery:
+    @pytest.mark.asyncio
+    async def test_authoritative_reconciliation_reports_name_change(self):
+        adapter = _make_adapter()
+        adapter._channel_state = {
+            CHANNEL: {"chat_type": "group", "last_ts": 1, "seen": {}},
+        }
+        adapter._channel_names = {CHANNEL: "old name"}
+        adapter._run_cli = AsyncMock(return_value=(0, json.dumps([
+            {"channel_id": CHANNEL, "name": "new name"},
+        ]), ""))
+
+        assert await adapter._discover_joined_channels(since=9) is True
+        assert adapter._channel_names[CHANNEL] == "new name"
+
+    @pytest.mark.asyncio
+    async def test_authoritative_reconciliation_removes_departed_group_but_preserves_dm(self):
+        adapter = _make_adapter()
+        adapter.cli_path = "/fake/buzz"
+        departed = "12c81eb7-3a12-47c1-b8af-c66f1c74ca8b"
+        dm = "4764ae67-7cd8-4f3e-967d-7dd93986b11a"
+        adapter._channel_state = {
+            CHANNEL: {"chat_type": "group", "last_ts": 1, "seen": {}},
+            departed: {"chat_type": "group", "last_ts": 1, "seen": {}},
+            dm: {"chat_type": "dm", "last_ts": 1, "seen": {}},
+        }
+        adapter._channel_names = {CHANNEL: "kept", departed: "gone", dm: "dm"}
+        adapter._run_cli = AsyncMock(return_value=(0, json.dumps([
+            {"channel_id": CHANNEL, "name": "kept"},
+        ]), ""))
+
+        assert await adapter._discover_joined_channels(since=9) is True
+        assert set(adapter._channel_state) == {CHANNEL, dm}
+        assert departed not in adapter._channel_names
+        assert departed not in adapter._directory_content()["channel_ids"]
+
+    @pytest.mark.asyncio
+    async def test_removal_event_closes_subscription_and_reprojects_directory(self):
+        adapter = _make_adapter()
+        departed = "12c81eb7-3a12-47c1-b8af-c66f1c74ca8b"
+        adapter._channel_state = {
+            CHANNEL: {"chat_type": "group", "last_ts": 1, "seen": {}},
+            departed: {"chat_type": "group", "last_ts": 1, "seen": {}},
+        }
+        adapter._discover_joined_channels = AsyncMock(side_effect=lambda **_: adapter._channel_state.pop(departed) is not None)
+        adapter._discover_dms = AsyncMock()
+        adapter._publish_directory_websocket = AsyncMock()
+        websocket = AsyncMock()
+        subscriptions = {"hermes-buzz-0": CHANNEL, "hermes-buzz-1": departed}
+
+        await adapter._handle_membership_event(
+            websocket, subscriptions, {"kind": 44101, "created_at": 10}
+        )
+
+        assert departed not in subscriptions.values()
+        assert json.loads(websocket.send.await_args_list[0].args[0]) == ["CLOSE", "hermes-buzz-1"]
+        adapter._publish_directory_websocket.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_explicit_channels_are_not_removed_by_authoritative_joined_snapshot(self):
+        adapter = _make_adapter({"channels": [CHANNEL]})
+        adapter._channel_state = {CHANNEL: {"chat_type": "group", "last_ts": 1, "seen": {}}}
+        adapter._run_cli = AsyncMock()
+        assert await adapter._discover_joined_channels(since=2) is False
+        assert CHANNEL in adapter._channel_state
+        adapter._run_cli.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_poll_sweep_does_not_publish_unchanged_successful_projection(self, monkeypatch):
+        adapter = _make_adapter({"poll_interval": 0.01})
+        adapter._channel_state = {CHANNEL: {"chat_type": "group", "last_ts": 1, "seen": {}}}
+        adapter._last_directory_projection = adapter._directory_projection()
+        adapter._discover_joined_channels = AsyncMock(return_value=False)
+        adapter._discover_dms = AsyncMock()
+        adapter._poll_channel = AsyncMock(side_effect=asyncio.CancelledError)
+        adapter._publish_directory_fallback = AsyncMock(return_value=True)
+        monkeypatch.setattr(_buzz_mod, "_DM_DISCOVERY_EVERY", 1)
+        with pytest.raises(asyncio.CancelledError):
+            await adapter._poll_loop()
+        adapter._discover_joined_channels.assert_awaited_once()
+        adapter._publish_directory_fallback.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("last_projection", ["previous", None])
+    async def test_poll_sweep_publishes_changed_state_or_retries_prior_failure(
+        self, monkeypatch, last_projection
+    ):
+        adapter = _make_adapter({"poll_interval": 0.01})
+        adapter._channel_state = {CHANNEL: {"chat_type": "group", "last_ts": 1, "seen": {}}}
+        adapter._last_directory_projection = last_projection
+        adapter._discover_joined_channels = AsyncMock(return_value=last_projection == "previous")
+        adapter._discover_dms = AsyncMock()
+        adapter._poll_channel = AsyncMock(side_effect=asyncio.CancelledError)
+        adapter._publish_directory_fallback = AsyncMock(return_value=True)
+        monkeypatch.setattr(_buzz_mod, "_DM_DISCOVERY_EVERY", 1)
+        with pytest.raises(asyncio.CancelledError):
+            await adapter._poll_loop()
+        adapter._publish_directory_fallback.assert_awaited_once()
+
 
     @pytest.mark.asyncio
     async def test_connect_lists_only_joined_channels(self, monkeypatch):
@@ -1611,6 +1709,7 @@ class TestChannelDiscovery:
         adapter = _make_adapter()
         adapter.cli_path = "/fake/buzz"
         adapter._start_websocket = AsyncMock(return_value=False)
+        adapter._publish_directory_fallback = AsyncMock(return_value=True)
         unjoined_channel = "12c81eb7-3a12-47c1-b8af-c66f1c74ca8b"
         cli = _ScriptedCli()
         cli.script(
@@ -1658,6 +1757,7 @@ class TestChannelDiscovery:
         ])
         cli.script("dms", "list", [])
         adapter._run_cli = cli
+        adapter._publish_directory_websocket = AsyncMock()
         websocket = AsyncMock()
         subscriptions = {"hermes-buzz-0": CHANNEL}
 
@@ -1675,6 +1775,7 @@ class TestChannelDiscovery:
         request = json.loads(websocket.send.await_args.args[0])
         assert request[2]["#h"] == [new_channel]
         assert request[2]["since"] == 1233
+        adapter._publish_directory_websocket.assert_awaited_once_with(websocket)
 
     @pytest.mark.asyncio
     async def test_membership_event_respects_explicit_channel_allowlist(self):
@@ -1689,6 +1790,7 @@ class TestChannelDiscovery:
         ])
         cli.script("dms", "list", [])
         adapter._run_cli = cli
+        adapter._publish_directory_websocket = AsyncMock()
         websocket = AsyncMock()
         subscriptions = {"hermes-buzz-0": CHANNEL}
 
@@ -1701,6 +1803,7 @@ class TestChannelDiscovery:
         assert new_channel not in adapter._channel_state
         assert new_channel not in subscriptions.values()
         websocket.send.assert_not_awaited()
+        adapter._publish_directory_websocket.assert_awaited_once_with(websocket)
 
     @pytest.mark.asyncio
     async def test_membership_event_retries_after_joined_channel_discovery_failure(self):

@@ -4,7 +4,20 @@ The Buzz adapter connects Hermes to a [Buzz](https://github.com/block/buzz) comm
 
 Buzz renders markdown, so agent replies keep their formatting. Outbound images are delivered as uploads (local files) or links (URLs). For inbound messages from authorized senders, same-relay Markdown images under Buzz's content-addressed `/media/` path are downloaded with the agent identity's existing Buzz authentication, integrity-checked against the URL hash, cached locally with owner-only permissions, and passed through Hermes' normal image pipeline. External image URLs remain links. A reply to a top-level DM or shared-channel message opens one thread under the triggering message; subsequent replies remain attached to the stable NIP-10 root instead of creating nested child threads. Progress and status messages inherit that same reply anchor. Direct sends and restored self-echoes are remembered as agent-authored thread roots, so replies to those roots remain eligible under the active-thread mention policy. Display-name activation is explicit: use `@Name`; a bare name embedded in ordinary prose or a path is not a mention. Exact npub and 64-character hex identity references remain supported.
 
-Inbound messages arrive over a persistent NIP-42-authenticated Nostr WebSocket subscription by default (near-instant delivery), with automatic fallback to CLI polling when the WebSocket can't be established. Outbound messages always go through the `buzz` CLI. Control it with `transport` / `BUZZ_TRANSPORT`: `auto` (default), `websocket` (require WS, fail otherwise), or `poll`. If your relay membership uses NIP-OA owner attestation, set `BUZZ_AUTH_TAG` to the four-string auth tag JSON.
+Inbound messages arrive over a persistent NIP-42-authenticated Nostr WebSocket subscription by default (near-instant delivery), with automatic fallback to CLI polling when the WebSocket can't be established. Outbound messages always go through the `buzz` CLI. Control it with `transport` / `BUZZ_TRANSPORT`: `auto` (default), `websocket` (require WS, fail otherwise), or `poll`. If your relay membership uses NIP-OA owner attestation, set `BUZZ_AUTH_TAG` to the four-string auth tag JSON. Hermes validates its lowercase-hex structure, conditions, and BIP-340 signature against this exact agent pubkey before sending it.
+
+After channel discovery, Hermes publishes a signed Buzz agent-directory record
+(kind 10100) for its own identity. The record advertises only the channels the
+gateway currently observes and projects the same allow-all or pubkey allowlist
+used by runtime authorization. It is refreshed after joined-channel
+reconciliation, periodically while polling, and on WebSocket reconnect. Departed
+group channels are removed and their live subscriptions are closed; DMs and
+explicitly configured channels are preserved. Relay acceptance is counted only
+after a matching positive ACK. WebSocket transport publishes on its active
+authenticated connection; poll transport uses a bounded, short-lived
+authenticated WebSocket solely for directory publication. Failed poll-mode
+publication is retried during later sweeps, unchanged records are suppressed,
+and reconnects always republish.
 
 > Run `hermes gateway setup` and pick **Buzz** for a guided walk-through.
 
@@ -34,7 +47,7 @@ gateway:
         cli_path: ""               # buzz binary (default: PATH, then ~/bin/buzz)
         credentials_file: ""       # JSON file with the nsec (BUZZ_PRIVATE_KEY fallback)
         activity_owner_pubkey: ""  # optional owner npub/hex; enables encrypted View activity events
-        allowed_users: []          # public hex pubkeys or npubs
+        allowed_users: []          # public hex pubkeys or npubs; empty denies all unless effective allow-all is set
         allow_all_users: false     # secure default: deny unlisted senders
         require_mention: true      # require a mention in shared channels (default: true)
         thread_require_mention: true  # require a fresh mention in thread replies (default: true)
@@ -167,4 +180,7 @@ Check status with `hermes gateway status` — Buzz connection state is reported 
 - Startup begins from current relay state rather than replaying channel history: the WebSocket subscription sets a current-time cursor after authentication, while polling seeds each channel's high-water mark from its newest event.
 - New DM conversations are discovered automatically (every few poll sweeps).
 - Protected inbound Buzz images require a recent `buzz` CLI with `buzz media get` support. If authenticated download or integrity validation fails, Hermes preserves the original Markdown link in the message instead of silently dropping it.
+- Joined groups are authoritatively reconciled in both transports. Kind 44100/44101 notifications trigger immediate WebSocket reconciliation; polling reconciles periodically. Removed groups are unsubscribed and disappear from directory publication, while DMs and explicit `channels` configuration retain their existing semantics.
+- Directory authentication and ACK waits use absolute deadlines and bounded unrelated-frame queues. Interleaved frames return to the sole receive loop exactly once; unrelated `NOTICE`/`CLOSED` frames are not mistaken for an event-specific negative ACK.
+- `home_channel` controls cron and notification delivery only. It does not broaden inbound observation and is not added to the public directory unless it is independently an eligible observed channel.
 - The private key is passed to the CLI via the subprocess environment — it never appears in argv or logs.

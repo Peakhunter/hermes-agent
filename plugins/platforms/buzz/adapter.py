@@ -48,7 +48,7 @@ import shutil
 import tempfile
 import time
 import unicodedata
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -137,7 +137,9 @@ _BUZZ_MEDIA_RETRY_DELAYS = (0.25, 0.75)
 # kind 44100 is Buzz's channel-membership event — used for live DM discovery.
 _WS_AUTH_TIMEOUT = 20.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
+_WS_DEFERRED_FRAME_CAP = 100
 _WS_MEMBERSHIP_KIND = 44100
+_WS_MEMBERSHIP_REMOVED_KIND = 44101
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
 _ACTIVITY_QUEUE_SIZE = 256
 _ACTIVITY_SEND_TIMEOUT = 2.0
@@ -148,6 +150,7 @@ _ACTIVITY_TERMINAL_KINDS = frozenset({"turn_completed", "turn_error"})
 
 _FALSE_VALUES = frozenset({"false", "0", "no", "off"})
 _YAML_BRIDGE_MARKER_PREFIX = "_HERMES_YAML_BRIDGED_"
+_AGENT_DIRECTORY_KIND = 10100
 
 # Where to look for a credentials JSON (keys: nsec / private_key_hex) when
 # BUZZ_PRIVATE_KEY is not set.  Module-level so tests can point it at a tmpdir.
@@ -745,6 +748,7 @@ class BuzzAdapter(BasePlatformAdapter):
         self._self_pubkey: str = ""
         self._self_npub: str = ""
         self._display_name: str = ""
+        self._profile_name: str = ""
 
         # Runtime state
         self._poll_task: Optional[asyncio.Task] = None
@@ -765,7 +769,9 @@ class BuzzAdapter(BasePlatformAdapter):
         self._activity_terminal_replay: OrderedDict[str, Dict[str, Any]] = (
             OrderedDict()
         )
+        self._ws_deferred_frames = deque()
         self._membership_since = 0
+        self._last_directory_projection: Optional[str] = None
         self._lock_key: Optional[str] = None
         # channel_id -> {"chat_type", "last_ts", "seen": OrderedDict[event_id, None]}
         self._channel_state: Dict[str, dict] = {}
@@ -826,6 +832,7 @@ class BuzzAdapter(BasePlatformAdapter):
             return False
         self._self_pubkey = str(profiles[0]["pubkey"]).lower()
         self._display_name = str(profiles[0].get("display_name") or "").strip()
+        self._profile_name = str(profiles[0].get("name") or self._display_name).strip()
         self._self_npub = hex_to_npub(self._self_pubkey) or ""
 
         # Prevent two profiles from driving the same Buzz identity on the
@@ -900,6 +907,10 @@ class BuzzAdapter(BasePlatformAdapter):
                 await self.disconnect()
                 return False
         if transport_used == "poll":
+            if not await self._publish_directory_fallback(force=True):
+                logger.warning(
+                    "Buzz: directory publication unavailable; will retry on reconnect"
+                )
             self._poll_task = asyncio.create_task(self._poll_loop())
         self._mark_connected()
         logger.info(
@@ -1503,29 +1514,65 @@ class BuzzAdapter(BasePlatformAdapter):
         BUZZ_AUTH_TAG), and wait for the OK acknowledgment."""
         build_auth_event = _load_nostr_auth().build_auth_event
 
-        raw = await asyncio.wait_for(websocket.recv(), timeout=_WS_AUTH_TIMEOUT)
-        message = json.loads(raw)
-        if not isinstance(message, list) or len(message) < 2 or message[0] != "AUTH":
-            raise ConnectionError("Buzz relay did not send a NIP-42 AUTH challenge")
+        deadline = asyncio.get_running_loop().time() + _WS_AUTH_TIMEOUT
+        unrelated = 0
+        while True:
+            raw = await self._recv_before_deadline(websocket, deadline, "Buzz WebSocket AUTH timed out")
+            try:
+                message = json.loads(raw)
+            except (ValueError, TypeError):
+                self._defer_ws_frame(raw)
+                unrelated += 1
+                if unrelated > _WS_DEFERRED_FRAME_CAP:
+                    raise ConnectionError("Buzz WebSocket AUTH received too many unrelated frames")
+                continue
+            if isinstance(message, list) and len(message) >= 2 and message[0] == "AUTH":
+                break
+            self._defer_ws_frame(raw)
+            unrelated += 1
+            if unrelated > _WS_DEFERRED_FRAME_CAP:
+                raise ConnectionError("Buzz WebSocket AUTH received too many unrelated frames")
         event = build_auth_event(
             private_key=self._private_key,
             challenge=str(message[1]),
             relay_url=self._websocket_url(),
-            auth_tag_json=os.getenv("BUZZ_AUTH_TAG", ""),
+            auth_tag_json=self._scoped_setting("BUZZ_AUTH_TAG"),
         )
         await websocket.send(json.dumps(["AUTH", event], separators=(",", ":")))
         while True:
-            raw = await asyncio.wait_for(websocket.recv(), timeout=_WS_AUTH_TIMEOUT)
-            response = json.loads(raw)
+            raw = await self._recv_before_deadline(websocket, deadline, "Buzz WebSocket AUTH timed out")
+            try:
+                response = json.loads(raw)
+            except (ValueError, TypeError):
+                self._defer_ws_frame(raw)
+                unrelated += 1
+                if unrelated > _WS_DEFERRED_FRAME_CAP:
+                    raise ConnectionError("Buzz WebSocket AUTH received too many unrelated frames")
+                continue
             if not isinstance(response, list) or not response:
                 continue
             if response[0] == "OK" and len(response) >= 4 and response[1] == event["id"]:
                 if response[2] is True:
                     return
                 raise ConnectionError(f"Buzz WebSocket AUTH rejected: {response[3]}")
-            if response[0] in ("NOTICE", "CLOSED"):
-                detail = response[-1] if len(response) > 1 else "authentication failed"
-                raise ConnectionError(f"Buzz WebSocket AUTH failed: {detail}")
+            self._defer_ws_frame(raw)
+            unrelated += 1
+            if unrelated > _WS_DEFERRED_FRAME_CAP:
+                raise ConnectionError("Buzz WebSocket AUTH received too many unrelated frames")
+
+    async def _recv_before_deadline(self, websocket, deadline: float, message: str):
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TimeoutError(message)
+        try:
+            return await asyncio.wait_for(websocket.recv(), timeout=remaining)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(message) from exc
+
+    def _defer_ws_frame(self, raw: str) -> None:
+        if len(self._ws_deferred_frames) >= _WS_DEFERRED_FRAME_CAP:
+            raise ConnectionError("Buzz WebSocket received too many unrelated frames")
+        self._ws_deferred_frames.append(raw)
 
     async def _send_channel_subscription(self, websocket, subscription_id: str, channel_id: str) -> None:
         state = self._channel_state.get(channel_id) or {}
@@ -1536,6 +1583,168 @@ class BuzzAdapter(BasePlatformAdapter):
             {"kinds": [_CHAT_KIND], "#h": [channel_id], "since": since},
         ]
         await websocket.send(json.dumps(request, separators=(",", ":")))
+
+    def _directory_content(self) -> dict:
+        """Project public discovery fields from effective adapter state."""
+        from agent.secret_scope import get_secret
+
+        allow_all_raw = get_secret("BUZZ_ALLOW_ALL_USERS", "")
+        allow_all = str(allow_all_raw).strip().lower() in ("true", "1", "yes", "on")
+        allow_all = allow_all or str(get_secret("GATEWAY_ALLOW_ALL_USERS", "")).strip().lower() in (
+            "true", "1", "yes", "on",
+        )
+        global_allowed_raw = str(get_secret("GATEWAY_ALLOWED_USERS", "") or "")
+        global_allowed = {
+            normalized
+            for entry in global_allowed_raw.split(",")
+            if (normalized := _normalize_user_ref(entry.strip()))
+        }
+
+        raw_configured_allowed = self._extra.get("allowed_users", [])
+        if isinstance(raw_configured_allowed, str):
+            raw_configured_allowed = raw_configured_allowed.split(",")
+        configured_allowed = {
+            normalized
+            for entry in raw_configured_allowed
+            if isinstance(entry, str)
+            and (normalized := _normalize_user_ref(entry))
+        }
+
+        # The platform allowlist is the narrowest advertised boundary when
+        # configured. Runtime enforcement itself remains owned by the central
+        # gateway authorization callback (including its global/pairing union).
+        if configured_allowed:
+            respond_to = "allowlist"
+            allowlist = sorted(configured_allowed)
+        elif allow_all:
+            respond_to = "anyone"
+            allowlist: List[str] = []
+        elif global_allowed:
+            respond_to = "allowlist"
+            allowlist = sorted(global_allowed)
+        else:
+            # Buzz's picker treats an empty allowlist as ineligible. This is
+            # the only supported wire representation of Hermes' deny-all.
+            respond_to = "allowlist"
+            allowlist = []
+
+        eligible = sorted(
+            channel_id
+            for channel_id, state in self._channel_state.items()
+            if state.get("chat_type") == "group"
+        )
+        display_name = self._display_name or self._profile_name or self._self_npub
+        return {
+            "name": self._profile_name or display_name,
+            "display_name": display_name,
+            "agent_type": "hermes-gateway",
+            "capabilities": ["chat"],
+            "status": "online",
+            "respond_to": respond_to,
+            "respond_to_allowlist": allowlist,
+            "channels": [self._channel_names.get(channel_id, channel_id) for channel_id in eligible],
+            "channel_ids": eligible,
+            "channel_add_policy": "owner_only",
+        }
+
+    def _directory_projection(self) -> str:
+        """Return the stable publication payload without opening a socket."""
+        auth_tag_json = self._scoped_setting("BUZZ_AUTH_TAG").strip()
+        tags: List[List[str]] = []
+        if auth_tag_json:
+            try:
+                auth_tag = json.loads(auth_tag_json)
+            except ValueError as exc:
+                raise ValueError("BUZZ_AUTH_TAG is not valid JSON") from exc
+            tags.append(auth_tag)
+        content = json.dumps(self._directory_content(), separators=(",", ":"), ensure_ascii=False)
+        return json.dumps([tags, content], separators=(",", ":"), ensure_ascii=False)
+
+    @staticmethod
+    def _scoped_setting(name: str) -> str:
+        from agent.secret_scope import get_secret
+
+        return str(get_secret(name, "") or "")
+
+    async def _publish_directory_websocket(self, websocket, *, force: bool = False) -> bool:
+        """Publish the complete replaceable directory event and require its ACK."""
+        timestamp = int(time.time())
+        auth_tag_json = self._scoped_setting("BUZZ_AUTH_TAG").strip()
+        tags: List[List[str]] = []
+        if auth_tag_json:
+            try:
+                auth_tag = json.loads(auth_tag_json)
+            except ValueError as exc:
+                raise ValueError("BUZZ_AUTH_TAG is not valid JSON") from exc
+            _load_nostr_auth().verify_auth_tag_for_event(
+                auth_tag,
+                self._self_pubkey,
+                kind=_AGENT_DIRECTORY_KIND,
+                created_at=timestamp,
+            )
+            tags.append(auth_tag)
+        content = json.dumps(self._directory_content(), separators=(",", ":"), ensure_ascii=False)
+        projection = json.dumps([tags, content], separators=(",", ":"), ensure_ascii=False)
+        if not force and projection == self._last_directory_projection:
+            return False
+        event = _load_nostr_auth().build_signed_event(
+            private_key=self._private_key,
+            kind=_AGENT_DIRECTORY_KIND,
+            tags=tags,
+            content=content,
+            created_at=timestamp,
+        )
+        await websocket.send(json.dumps(["EVENT", event], separators=(",", ":")))
+        deadline = asyncio.get_running_loop().time() + _WS_AUTH_TIMEOUT
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError("Buzz directory publication ACK timed out")
+            raw = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+            try:
+                response = json.loads(raw)
+            except (ValueError, TypeError):
+                self._defer_ws_frame(raw)
+                continue
+            if not isinstance(response, list) or not response:
+                continue
+            if response[0] == "OK" and len(response) >= 4 and response[1] == event["id"]:
+                if response[2] is True:
+                    self._last_directory_projection = projection
+                    return True
+                raise ConnectionError(f"Buzz directory publication rejected: {response[3]}")
+            self._defer_ws_frame(raw)
+
+    async def _publish_directory_fallback(self, *, force: bool = False) -> bool:
+        """Publish over a short-lived authenticated socket for poll transport."""
+        if not force and self._directory_projection() == self._last_directory_projection:
+            return False
+        try:
+            import websockets
+
+            self._ws_deferred_frames.clear()
+            async with asyncio.timeout(_WS_AUTH_TIMEOUT):
+                async with websockets.connect(
+                    self._websocket_url(),
+                    open_timeout=_WS_AUTH_TIMEOUT,
+                    close_timeout=5,
+                    ping_interval=None,
+                    max_size=_WS_MAX_MESSAGE_BYTES,
+                ) as websocket:
+                    await self._authenticate_websocket(websocket)
+                    await self._publish_directory_websocket(websocket, force=force)
+            self._ws_deferred_frames.clear()
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Do not include exception text: authentication failures can echo
+            # relay-supplied material, while this best-effort path must never
+            # disclose configured credentials in logs.
+            logger.warning("Buzz: bounded directory publication attempt failed")
+            return False
+        finally:
+            self._ws_deferred_frames.clear()
 
     async def _subscribe_websocket(self, websocket) -> Dict[str, Optional[str]]:
         """Subscribe to every watched conversation plus membership events
@@ -1550,7 +1759,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 "REQ",
                 _WS_MEMBERSHIP_SUB_ID,
                 {
-                    "kinds": [_WS_MEMBERSHIP_KIND],
+                    "kinds": [_WS_MEMBERSHIP_KIND, _WS_MEMBERSHIP_REMOVED_KIND],
                     "#p": [self._self_pubkey],
                     "since": max(self._membership_since - 1, 0),
                 },
@@ -1563,10 +1772,14 @@ class BuzzAdapter(BasePlatformAdapter):
         """Rediscover and subscribe after a membership event p-tagged to us."""
         event_since = max(int(event.get("created_at") or 0), 0)
         before = set(self._channel_state)
-        if not await self._discover_joined_channels(since=event_since):
+        if await self._discover_joined_channels(since=event_since) is None:
             raise ConnectionError("Buzz joined-channel discovery failed")
         self._membership_since = max(self._membership_since, event_since)
         await self._discover_dms(seed=False)
+        for subscription_id, channel_id in list(subscriptions.items()):
+            if channel_id is not None and channel_id not in self._channel_state:
+                await websocket.send(json.dumps(["CLOSE", subscription_id], separators=(",", ":")))
+                del subscriptions[subscription_id]
         for channel_id in self._channel_state:
             if channel_id in before:
                 continue
@@ -1574,6 +1787,7 @@ class BuzzAdapter(BasePlatformAdapter):
             subscriptions[subscription_id] = channel_id
             await self._send_channel_subscription(websocket, subscription_id, channel_id)
             logger.info("Buzz: subscribed to new conversation %s", channel_id)
+        await self._publish_directory_websocket(websocket)
 
     def _handle_activity_ack(self, message: list) -> bool:
         """Correlate an observer EVENT acknowledgment and surface rejection."""
@@ -1607,16 +1821,22 @@ class BuzzAdapter(BasePlatformAdapter):
                         ping_timeout=20,
                         max_size=_WS_MAX_MESSAGE_BYTES,
                     ) as websocket:
+                        self._ws_deferred_frames.clear()
                         await self._authenticate_websocket(websocket)
                         self._activity_ws_generation += 1
                         self._ws_connection = websocket
+                        await self._publish_directory_websocket(websocket, force=True)
                         subscriptions = await self._subscribe_websocket(websocket)
                         self._ws_active = True
                         self._replay_terminal_activity()
                         if self._ws_ready is not None:
                             self._ws_ready.set()
                         backoff = 1.0
-                        async for raw in websocket:
+                        while True:
+                            if self._ws_deferred_frames:
+                                raw = self._ws_deferred_frames.popleft()
+                            else:
+                                raw = await websocket.recv()
                             try:
                                 message = json.loads(raw)
                             except (ValueError, TypeError):
@@ -1671,6 +1891,11 @@ class BuzzAdapter(BasePlatformAdapter):
                 self._poll_count += 1
                 try:
                     if self._poll_count % _DM_DISCOVERY_EVERY == 0:
+                        changed = await self._discover_joined_channels(since=int(time.time()))
+                        if changed is not None and (
+                            changed or self._directory_projection() != self._last_directory_projection
+                        ):
+                            await self._publish_directory_fallback()
                         await self._discover_dms(seed=False)
                     for channel_id in list(self._channel_state):
                         await self._poll_channel(channel_id)
@@ -1710,31 +1935,44 @@ class BuzzAdapter(BasePlatformAdapter):
             self._remember_agent_thread_event(state, event)
         self._trim_seen(state)
 
-    async def _discover_joined_channels(self, *, since: int) -> bool:
-        """Watch newly joined channels when no explicit allowlist is set."""
+    async def _discover_joined_channels(self, *, since: int) -> Optional[bool]:
+        """Return membership/name change state, or None when listing fails."""
         if self.channels:
-            return True
+            return False
         code, out, err = await self._run_cli(["channels", "list", "--member"])
         if code != 0:
             logger.warning(
                 "Buzz: failed to rediscover joined channels — %s",
                 _cli_error_message(err, code),
             )
-            return False
-        for channel in _parse_json_list(out):
+            return None
+        listed = _parse_json_list(out)
+        joined_ids = {str(channel.get("channel_id")) for channel in listed if channel.get("channel_id")}
+        changed = False
+        for channel_id, state in list(self._channel_state.items()):
+            if state.get("chat_type") == "group" and channel_id not in joined_ids:
+                changed = True
+                del self._channel_state[channel_id]
+                self._channel_names.pop(channel_id, None)
+                self._channel_meta.pop(channel_id, None)
+        for channel in listed:
             channel_id = str(channel.get("channel_id") or "")
             if not channel_id:
                 continue
+            name = str(channel.get("name") or channel_id)
+            if self._channel_names.get(channel_id) != name:
+                changed = True
             self._channel_meta[channel_id] = channel
-            self._channel_names[channel_id] = str(channel.get("name") or channel_id)
+            self._channel_names[channel_id] = name
             if channel_id in self._channel_state:
                 continue
+            changed = True
             self._channel_state[channel_id] = {
                 "chat_type": "group",
                 "last_ts": max(int(since), 0),
                 "seen": OrderedDict(),
             }
-        return True
+        return changed
 
     async def _discover_dms(self, *, seed: bool) -> None:
         """Watch DM conversations.  New ones found mid-run dispatch from their

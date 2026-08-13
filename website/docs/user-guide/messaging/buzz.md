@@ -4,7 +4,20 @@ The Buzz adapter connects Hermes to a [Buzz](https://github.com/block/buzz) comm
 
 Buzz renders markdown, so agent replies keep their formatting. Images are delivered as uploads (local files) or links (URLs). Replies can thread onto an existing message via its event id.
 
-Inbound messages arrive over a persistent NIP-42-authenticated Nostr WebSocket subscription by default (near-instant delivery), with automatic fallback to CLI polling when the WebSocket can't be established. Outbound messages always go through the `buzz` CLI. Control it with `transport` / `BUZZ_TRANSPORT`: `auto` (default), `websocket` (require WS, fail otherwise), or `poll`. If your relay membership uses NIP-OA owner attestation, set `BUZZ_AUTH_TAG` to the four-string auth tag JSON.
+Inbound messages arrive over a persistent NIP-42-authenticated Nostr WebSocket subscription by default (near-instant delivery), with automatic fallback to CLI polling when the WebSocket can't be established. Outbound messages always go through the `buzz` CLI. Control it with `transport` / `BUZZ_TRANSPORT`: `auto` (default), `websocket` (require WS, fail otherwise), or `poll`. If your relay membership uses NIP-OA owner attestation, set `BUZZ_AUTH_TAG` to the four-string auth tag JSON. Hermes validates its lowercase-hex structure, conditions, and BIP-340 signature against this exact agent pubkey before sending it.
+
+After channel discovery, Hermes publishes a signed Buzz agent-directory record
+(kind 10100) for its own identity. The record advertises only the channels the
+gateway currently observes and projects the same allow-all or pubkey allowlist
+used by runtime authorization. It is refreshed after joined-channel
+reconciliation, periodically while polling, and on WebSocket reconnect. Departed
+group channels are removed and their live subscriptions are closed; DMs and
+explicitly configured channels are preserved. Relay acceptance is counted only
+after a matching positive ACK. WebSocket transport publishes on its active
+authenticated connection; poll transport uses a bounded, short-lived
+authenticated WebSocket solely for directory publication. Failed poll-mode
+publication is retried during later sweeps, unchanged records are suppressed,
+and reconnects always republish.
 
 > Run `hermes gateway setup` and pick **Buzz** for a guided walk-through.
 
@@ -33,7 +46,7 @@ gateway:
         poll_interval: 4           # seconds between inbound poll sweeps
         cli_path: ""               # buzz binary (default: PATH, then ~/bin/buzz)
         credentials_file: ""       # JSON file with the nsec (BUZZ_PRIVATE_KEY fallback)
-        allowed_users: []          # empty = allow all; hex pubkeys or npubs
+        allowed_users: []          # empty = deny all unless an effective allow-all flag is set
 ```
 
 Plus, in `~/.hermes/.env`:
@@ -117,7 +130,10 @@ Check status with `hermes gateway status` — Buzz connection state is reported 
 
 ## Notes and limitations
 
-- **Inbound is polled, not streamed.** The `buzz` CLI is request/response, so the adapter polls `buzz messages get` per watched channel every `poll_interval` seconds (default 4). Expect up to one interval of latency on inbound messages. A future optimization is a websocket transport (the Buzz repo ships `buzz-ws-client` for true streaming).
+- WebSocket is the preferred inbound transport. In `auto` mode, Hermes falls back to polling `buzz messages get` per watched channel when an authenticated WebSocket cannot be established; expect up to one `poll_interval` of latency while polling.
 - On (re)connect the adapter seeds its high-water mark from the newest events, so channel history is never replayed into the agent.
 - New DM conversations are discovered automatically (every few poll sweeps).
+- Joined groups are authoritatively reconciled in both transports. Kind 44100/44101 notifications trigger immediate WebSocket reconciliation; polling reconciles periodically. Removed groups are unsubscribed and disappear from directory publication, while DMs and explicit `channels` configuration retain their existing semantics.
+- Directory authentication and ACK waits use absolute deadlines and bounded unrelated-frame queues. Interleaved frames return to the sole receive loop exactly once; unrelated `NOTICE`/`CLOSED` frames are not mistaken for an event-specific negative ACK.
+- `home_channel` controls cron and notification delivery only. It does not broaden inbound observation and is not added to the public directory unless it is independently an eligible observed channel.
 - The private key is passed to the CLI via the subprocess environment — it never appears in argv or logs.

@@ -36,7 +36,7 @@ The spawned Hermes uses the same config, credentials, memory, and skills as `her
 
 ## ③ Native gateway platform (recommended for full Hermes)
 
-The bundled `buzz` platform plugin makes Buzz a normal Hermes messaging platform — channels, DMs, mention gating, threaded replies, reactions, images, and cron delivery (`deliver=buzz`), with Hermes' own approvals, memory, and session management intact. Inbound arrives over a persistent NIP-42-authenticated Nostr WebSocket (dependency-free BIP-340 signing) with automatic fallback to CLI polling; outbound goes through the `buzz` CLI.
+The bundled `buzz` platform plugin makes Buzz a normal Hermes messaging platform — channels, DMs, mention gating, threaded replies, reactions, images, and cron delivery (`deliver=buzz`), with Hermes' own approvals, memory, and session management intact. Inbound arrives over a persistent NIP-42-authenticated Nostr WebSocket (dependency-free BIP-340 signing) with automatic fallback to CLI polling; outbound goes through the `buzz` CLI. After discovery and joined-channel reconciliation, Hermes also publishes a complete signed kind-10100 directory projection on an authenticated WebSocket, requiring the relay's matching positive ACK. Membership additions/removals refresh it in push mode; poll mode periodically reconciles and retries publication.
 
 ```bash
 hermes gateway setup   # pick Buzz

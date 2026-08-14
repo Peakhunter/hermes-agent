@@ -506,6 +506,17 @@ def _parse_json_list(stdout: str) -> List[dict]:
     return [item for item in data if isinstance(item, dict)]
 
 
+def _parse_json_list_strict(stdout: str) -> Optional[List[dict]]:
+    """Parse a JSON object array, preserving malformed-vs-empty distinction."""
+    try:
+        data = json.loads(stdout)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
+        return None
+    return data
+
+
 def _event_reply_target(event: dict) -> str:
     """Return the thread anchor referenced by a Buzz chat event."""
     tags = event.get("tags")
@@ -1574,15 +1585,53 @@ class BuzzAdapter(BasePlatformAdapter):
             raise ConnectionError("Buzz WebSocket received too many unrelated frames")
         self._ws_deferred_frames.append(raw)
 
-    async def _send_channel_subscription(self, websocket, subscription_id: str, channel_id: str) -> None:
+    async def _send_channel_subscription(
+        self,
+        websocket,
+        subscription_id: str,
+        channel_id: str,
+        *,
+        since: Optional[int] = None,
+    ) -> None:
         state = self._channel_state.get(channel_id) or {}
-        since = max(int(state.get("last_ts") or time.time()) - 1, 0)
+        if since is None:
+            last_ts = int(state.get("last_ts") or time.time())
+            subscription_floor = int(state.get("subscription_floor") or 0)
+            since = max(last_ts - 1, subscription_floor, 0)
+        else:
+            since = max(int(since), 0)
         request = [
             "REQ",
             subscription_id,
             {"kinds": [_CHAT_KIND], "#h": [channel_id], "since": since},
         ]
         await websocket.send(json.dumps(request, separators=(",", ":")))
+
+    async def _subscribe_missing_channels(
+        self,
+        websocket,
+        subscriptions: Dict[str, Optional[str]],
+    ) -> None:
+        """Subscribe every watched channel not already represented on the socket."""
+        subscribed_channels = {
+            channel_id for channel_id in subscriptions.values() if channel_id is not None
+        }
+        for channel_id in self._channel_state:
+            if channel_id in subscribed_channels:
+                continue
+            subscription_index = len(subscriptions)
+            subscription_id = f"hermes-buzz-dm-{subscription_index}"
+            while subscription_id in subscriptions:
+                subscription_index += 1
+                subscription_id = f"hermes-buzz-dm-{subscription_index}"
+            await self._send_channel_subscription(
+                websocket,
+                subscription_id,
+                channel_id,
+            )
+            subscriptions[subscription_id] = channel_id
+            subscribed_channels.add(channel_id)
+            logger.info("Buzz: subscribed to new conversation %s", channel_id)
 
     def _directory_content(self) -> dict:
         """Project public discovery fields from effective adapter state."""
@@ -1769,24 +1818,99 @@ class BuzzAdapter(BasePlatformAdapter):
         return subscriptions
 
     async def _handle_membership_event(self, websocket, subscriptions: Dict[str, Optional[str]], event: dict) -> None:
-        """Rediscover and subscribe after a membership event p-tagged to us."""
+        """Reconcile subscriptions after a membership event p-tagged to us."""
         event_since = max(int(event.get("created_at") or 0), 0)
+        kind = int(event.get("kind") or 0)
+        # Adds older than the discovery cursor are stale. Removals still need
+        # an authoritative snapshot: notifications for different channels can
+        # arrive out of timestamp order, and the snapshot also handles rejoin.
+        if (
+            event_since < self._membership_since
+            and kind != _WS_MEMBERSHIP_REMOVED_KIND
+        ):
+            return
+        tags = event.get("tags")
+        channel_id = ""
+        if isinstance(tags, list):
+            channel_id = next(
+                (
+                    str(tag[1])
+                    for tag in tags
+                    if isinstance(tag, (list, tuple))
+                    and len(tag) > 1
+                    and tag[0] == "h"
+                ),
+                "",
+            )
+
+        if kind == _WS_MEMBERSHIP_REMOVED_KIND:
+            self._membership_since = max(self._membership_since, event_since)
+            # Explicitly configured channels are a static restrictive watch set.
+            # Membership notifications must not mutate that operator-owned scope.
+            if self.channels:
+                return
+            if await self._discover_joined_channels(seed=True, reconcile=True) is None:
+                raise ConnectionError("Buzz joined-channel reconciliation failed")
+            for subscription_id, subscribed_channel in list(subscriptions.items()):
+                if (
+                    subscribed_channel is None
+                    or subscribed_channel in self._channel_state
+                ):
+                    continue
+                await websocket.send(
+                    json.dumps(["CLOSE", subscription_id], separators=(",", ":"))
+                )
+                subscriptions.pop(subscription_id, None)
+                logger.info(
+                    "Buzz: unsubscribed from removed conversation %s",
+                    subscribed_channel,
+                )
+            # A removal snapshot can simultaneously reveal another join/rejoin.
+            # Seeding above supplies a replay-safe floor for its subscription.
+            await self._subscribe_missing_channels(websocket, subscriptions)
+            await self._publish_directory_websocket(websocket)
+            return
+        if kind != _WS_MEMBERSHIP_KIND:
+            return
+
         before = set(self._channel_state)
-        if await self._discover_joined_channels(since=event_since) is None:
+        if await self._discover_joined_channels(
+            since=event_since, seed=True, target_channel_id=channel_id
+        ) is None:
             raise ConnectionError("Buzz joined-channel discovery failed")
         self._membership_since = max(self._membership_since, event_since)
+
+        async def subscribe_discovered() -> None:
+            for discovered_channel_id in self._channel_state:
+                if discovered_channel_id in before:
+                    continue
+                subscription_index = len(subscriptions)
+                subscription_id = f"hermes-buzz-dm-{subscription_index}"
+                while subscription_id in subscriptions:
+                    subscription_index += 1
+                    subscription_id = f"hermes-buzz-dm-{subscription_index}"
+                subscription_since = (
+                    event_since
+                    if channel_id and discovered_channel_id == channel_id
+                    else None
+                )
+                await self._send_channel_subscription(
+                    websocket,
+                    subscription_id,
+                    discovered_channel_id,
+                    since=subscription_since,
+                )
+                subscriptions[subscription_id] = discovered_channel_id
+                before.add(discovered_channel_id)
+                logger.info(
+                    "Buzz: subscribed to new conversation %s", discovered_channel_id
+                )
+
+        # The membership-target channel is time-sensitive. Subscribe before
+        # unrelated DM discovery can spend up to two CLI timeouts.
+        await subscribe_discovered()
         await self._discover_dms(seed=False)
-        for subscription_id, channel_id in list(subscriptions.items()):
-            if channel_id is not None and channel_id not in self._channel_state:
-                await websocket.send(json.dumps(["CLOSE", subscription_id], separators=(",", ":")))
-                del subscriptions[subscription_id]
-        for channel_id in self._channel_state:
-            if channel_id in before:
-                continue
-            subscription_id = f"hermes-buzz-dm-{len(subscriptions)}"
-            subscriptions[subscription_id] = channel_id
-            await self._send_channel_subscription(websocket, subscription_id, channel_id)
-            logger.info("Buzz: subscribed to new conversation %s", channel_id)
+        await subscribe_discovered()
         await self._publish_directory_websocket(websocket)
 
     def _handle_activity_ack(self, message: list) -> bool:
@@ -1823,6 +1947,13 @@ class BuzzAdapter(BasePlatformAdapter):
                     ) as websocket:
                         self._ws_deferred_frames.clear()
                         await self._authenticate_websocket(websocket)
+                        if await self._discover_joined_channels(
+                            seed=True, reconcile=True
+                        ) is None:
+                            raise ConnectionError(
+                                "Buzz joined-channel reconciliation failed"
+                            )
+                        await self._discover_dms(seed=False)
                         self._activity_ws_generation += 1
                         self._ws_connection = websocket
                         await self._publish_directory_websocket(websocket, force=True)
@@ -1891,7 +2022,9 @@ class BuzzAdapter(BasePlatformAdapter):
                 self._poll_count += 1
                 try:
                     if self._poll_count % _DM_DISCOVERY_EVERY == 0:
-                        changed = await self._discover_joined_channels(since=int(time.time()))
+                        changed = await self._discover_joined_channels(
+                            seed=True, reconcile=True
+                        )
                         if changed is not None and (
                             changed or self._directory_projection() != self._last_directory_projection
                         ):
@@ -1906,20 +2039,36 @@ class BuzzAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             raise
 
-    async def _seed_channel(self, channel_id: str, chat_type: str) -> None:
-        """Initialize a channel's high-water mark from its newest events."""
+    async def _seed_channel(
+        self,
+        channel_id: str,
+        chat_type: str,
+        *,
+        before: int = 0,
+        safe_floor: bool = False,
+    ) -> None:
+        """Initialize a channel's high-water mark from its newest history."""
         state = {"chat_type": chat_type, "last_ts": 0, "seen": OrderedDict()}
         self._channel_state[channel_id] = state
-        code, out, err = await self._run_cli(
-            ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
-        )
+        safe_boundary = int(time.time()) if safe_floor else 0
+        history_before = before or max(safe_boundary - 1, 0)
+        args = [
+            "messages", "get", "--channel", channel_id,
+            "--limit", str(_FETCH_LIMIT),
+        ]
+        if history_before:
+            args.extend(["--before", str(history_before)])
+        code, out, err = await self._run_cli(args)
         if code != 0:
             logger.warning(
                 "Buzz: could not seed channel %s — %s", channel_id, _cli_error_message(err, code)
             )
-            # Fall back to "now" so a transiently unreadable channel does not
-            # replay its whole history once it becomes readable.
-            state["last_ts"] = int(time.time())
+            # Fall back to a safe current boundary so a transiently unreadable
+            # channel does not replay history once it becomes readable.
+            floor = safe_boundary if safe_floor else int(time.time())
+            state["last_ts"] = floor
+            if safe_floor:
+                state["subscription_floor"] = floor
             return
         for event in _parse_json_list(out):
             event_id = event.get("id")
@@ -1934,9 +2083,20 @@ class BuzzAdapter(BasePlatformAdapter):
             self._remember_event_thread_root(state, event)
             self._remember_agent_thread_event(state, event)
         self._trim_seen(state)
+        if safe_floor:
+            floor = max(safe_boundary, int(state["last_ts"]) + 1)
+            state["last_ts"] = floor
+            state["subscription_floor"] = floor
 
-    async def _discover_joined_channels(self, *, since: int) -> Optional[bool]:
-        """Return membership/name change state, or None when listing fails."""
+    async def _discover_joined_channels(
+        self,
+        *,
+        since: int = 0,
+        seed: bool = False,
+        target_channel_id: str = "",
+        reconcile: bool = True,
+    ) -> Optional[bool]:
+        """Reconcile joined streams; return changed state or ``None`` on failure."""
         if self.channels:
             return False
         code, out, err = await self._run_cli(["channels", "list", "--member"])
@@ -1946,16 +2106,35 @@ class BuzzAdapter(BasePlatformAdapter):
                 _cli_error_message(err, code),
             )
             return None
-        listed = _parse_json_list(out)
-        joined_ids = {str(channel.get("channel_id")) for channel in listed if channel.get("channel_id")}
+        channels = _parse_json_list_strict(out)
+        if channels is None:
+            logger.warning("Buzz: joined-channel discovery returned malformed JSON")
+            return None
+        joined_ids = {
+            str(channel.get("channel_id") or "") for channel in channels
+        }
+        if target_channel_id and target_channel_id not in joined_ids:
+            logger.warning(
+                "Buzz: membership channel %s missing from joined-channel snapshot",
+                target_channel_id,
+            )
+            return None
         changed = False
-        for channel_id, state in list(self._channel_state.items()):
-            if state.get("chat_type") == "group" and channel_id not in joined_ids:
-                changed = True
-                del self._channel_state[channel_id]
-                self._channel_names.pop(channel_id, None)
-                self._channel_meta.pop(channel_id, None)
-        for channel in listed:
+        if reconcile:
+            for watched_channel_id, state in list(self._channel_state.items()):
+                if (
+                    state.get("chat_type") == "group"
+                    and watched_channel_id not in joined_ids
+                ):
+                    changed = True
+                    self._channel_state.pop(watched_channel_id, None)
+                    self._channel_names.pop(watched_channel_id, None)
+                    self._channel_meta.pop(watched_channel_id, None)
+                    logger.info(
+                        "Buzz: stopped watching channel no longer joined: %s",
+                        watched_channel_id,
+                    )
+        for channel in channels:
             channel_id = str(channel.get("channel_id") or "")
             if not channel_id:
                 continue
@@ -1967,11 +2146,31 @@ class BuzzAdapter(BasePlatformAdapter):
             if channel_id in self._channel_state:
                 continue
             changed = True
-            self._channel_state[channel_id] = {
-                "chat_type": "group",
-                "last_ts": max(int(since), 0),
-                "seen": OrderedDict(),
-            }
+            channel_since = (
+                int(since)
+                if not target_channel_id or channel_id == target_channel_id
+                else 0
+            )
+            if seed:
+                # Buzz maps --before to Nostr's inclusive `until`; stop at the
+                # prior second so events sharing the join timestamp stay live.
+                history_before = max(channel_since - 1, 0) if channel_since else 0
+                await self._seed_channel(
+                    channel_id,
+                    chat_type="group",
+                    before=history_before,
+                    safe_floor=not bool(channel_since),
+                )
+                state = self._channel_state[channel_id]
+                state["last_ts"] = max(state["last_ts"], channel_since)
+                if channel_since:
+                    state["subscription_floor"] = channel_since
+            else:
+                self._channel_state[channel_id] = {
+                    "chat_type": "group",
+                    "last_ts": max(channel_since, 0),
+                    "seen": OrderedDict(),
+                }
         return changed
 
     async def _discover_dms(self, *, seed: bool) -> None:

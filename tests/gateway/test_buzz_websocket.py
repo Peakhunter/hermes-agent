@@ -776,7 +776,9 @@ async def test_joined_channel_reconciliation_refreshes_directory_after_subscript
     }
     new_channel = "4764ae67-7cd8-4f3e-967d-7dd93986b11a"
 
-    async def discover(*, since):
+    async def discover(*, since, seed, target_channel_id):
+        assert seed is True
+        assert target_channel_id == ""
         adapter._channel_state[new_channel] = {
             "chat_type": "group", "last_ts": since, "seen": {},
         }
@@ -927,6 +929,8 @@ async def test_websocket_startup_wiring_delivers_deferred_frame_exactly_once(mon
         return True
 
     adapter._publish_directory_websocket = publish
+    adapter._discover_joined_channels = AsyncMock(return_value=False)
+    adapter._discover_dms = AsyncMock()
     adapter._subscribe_websocket = AsyncMock(
         side_effect=lambda _ws: order.append("subscribe") or {"hermes-buzz-0": CHANNEL}
     )
@@ -937,6 +941,8 @@ async def test_websocket_startup_wiring_delivers_deferred_frame_exactly_once(mon
         await adapter._websocket_loop()
 
     assert order == ["auth", ("publish", True), "subscribe"]
+    adapter._discover_joined_channels.assert_awaited_once_with(seed=True, reconcile=True)
+    adapter._discover_dms.assert_awaited_once_with(seed=False)
     adapter._handle_event.assert_awaited_once_with(CHANNEL, adapter._channel_state[CHANNEL], event)
 
 

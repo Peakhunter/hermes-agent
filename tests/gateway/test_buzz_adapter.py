@@ -1764,7 +1764,11 @@ class TestChannelDiscovery:
         await adapter._handle_membership_event(
             websocket,
             subscriptions,
-            {"created_at": 1234, "kind": _buzz_mod._WS_MEMBERSHIP_KIND},
+            {
+                "created_at": 1234,
+                "kind": _buzz_mod._WS_MEMBERSHIP_KIND,
+                "tags": [["p", SELF_PUBKEY], ["h", new_channel]],
+            },
         )
 
         assert new_channel in adapter._channel_state
@@ -1774,7 +1778,7 @@ class TestChannelDiscovery:
         assert (["channels", "list", "--member"], None) in cli.calls
         request = json.loads(websocket.send.await_args.args[0])
         assert request[2]["#h"] == [new_channel]
-        assert request[2]["since"] == 1233
+        assert request[2]["since"] == 1234
         adapter._publish_directory_websocket.assert_awaited_once_with(websocket)
 
     @pytest.mark.asyncio
@@ -1823,6 +1827,134 @@ class TestChannelDiscovery:
 
         assert adapter._membership_since == 100
         websocket.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_removal_reconciliation_subscribes_concurrent_new_join(self, monkeypatch):
+        existing_channel = CHANNEL
+        removed_channel = "4764ae67-7cd8-4f3e-967d-7dd93986b11a"
+        new_channel = "85f52f6f-af83-4a91-bb7a-4e3605cf8e6e"
+        monkeypatch.setattr(_buzz_mod.time, "time", lambda: 2000)
+        adapter = _make_adapter()
+        adapter._membership_since = 100
+        adapter._channel_state[existing_channel] = {
+            "chat_type": "group", "last_ts": 100, "seen": {},
+        }
+        adapter._channel_state[removed_channel] = {
+            "chat_type": "group", "last_ts": 100, "seen": {},
+        }
+        cli = _ScriptedCli()
+        cli.script("channels", "list", [
+            {"channel_id": existing_channel, "name": "general"},
+            {"channel_id": new_channel, "name": "new"},
+        ])
+        cli.script("messages", "get", [])
+        adapter._run_cli = cli
+        adapter._publish_directory_websocket = AsyncMock()
+        websocket = AsyncMock()
+        subscriptions = {
+            "existing": existing_channel,
+            "removed": removed_channel,
+            _buzz_mod._WS_MEMBERSHIP_SUB_ID: None,
+        }
+
+        await adapter._handle_membership_event(
+            websocket,
+            subscriptions,
+            {
+                "created_at": 1500,
+                "kind": _buzz_mod._WS_MEMBERSHIP_REMOVED_KIND,
+                "tags": [["p", SELF_PUBKEY], ["h", removed_channel]],
+            },
+        )
+
+        assert removed_channel not in adapter._channel_state
+        assert removed_channel not in subscriptions.values()
+        assert new_channel in adapter._channel_state
+        assert new_channel in subscriptions.values()
+        requests = [json.loads(call.args[0]) for call in websocket.send.await_args_list]
+        assert ["CLOSE", "removed"] in requests
+        new_request = next(
+            request
+            for request in requests
+            if len(request) > 2 and request[2].get("#h") == [new_channel]
+        )
+        assert new_request[2]["since"] == 2000
+        adapter._publish_directory_websocket.assert_awaited_once_with(websocket)
+
+    @pytest.mark.asyncio
+    async def test_out_of_order_removals_reconcile_each_authoritative_snapshot(self):
+        first_channel = CHANNEL
+        second_channel = "4764ae67-7cd8-4f3e-967d-7dd93986b11a"
+        adapter = _make_adapter()
+        adapter._membership_since = 100
+        adapter._channel_state[first_channel] = {
+            "chat_type": "group", "last_ts": 100, "seen": {},
+        }
+        adapter._channel_state[second_channel] = {
+            "chat_type": "group", "last_ts": 100, "seen": {},
+        }
+        cli = _ScriptedCli()
+        cli.script("channels", "list", [
+            {"channel_id": second_channel, "name": "second"},
+        ])
+        cli.script("channels", "list", [])
+        adapter._run_cli = cli
+        adapter._publish_directory_websocket = AsyncMock()
+        websocket = AsyncMock()
+        subscriptions = {"first": first_channel, "second": second_channel}
+
+        await adapter._handle_membership_event(
+            websocket,
+            subscriptions,
+            {
+                "created_at": 1001,
+                "kind": _buzz_mod._WS_MEMBERSHIP_REMOVED_KIND,
+                "tags": [["p", SELF_PUBKEY], ["h", first_channel]],
+            },
+        )
+        await adapter._handle_membership_event(
+            websocket,
+            subscriptions,
+            {
+                "created_at": 1000,
+                "kind": _buzz_mod._WS_MEMBERSHIP_REMOVED_KIND,
+                "tags": [["p", SELF_PUBKEY], ["h", second_channel]],
+            },
+        )
+
+        assert adapter._channel_state == {}
+        assert subscriptions == {}
+        assert adapter._membership_since == 1001
+        assert [call[0] for call in cli.calls].count(
+            ["channels", "list", "--member"]
+        ) == 2
+        assert websocket.send.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_membership_removal_preserves_explicit_channel_configuration(self):
+        adapter = _make_adapter({"channels": [CHANNEL]})
+        adapter._membership_since = 100
+        state = {"chat_type": "group", "last_ts": 100, "seen": {}}
+        adapter._channel_state[CHANNEL] = state
+        adapter._publish_directory_websocket = AsyncMock()
+        websocket = AsyncMock()
+        subscriptions = {"hermes-buzz-0": CHANNEL}
+
+        await adapter._handle_membership_event(
+            websocket,
+            subscriptions,
+            {
+                "created_at": 1234,
+                "kind": _buzz_mod._WS_MEMBERSHIP_REMOVED_KIND,
+                "tags": [["p", SELF_PUBKEY], ["h", CHANNEL]],
+            },
+        )
+
+        assert adapter._channel_state[CHANNEL] is state
+        assert subscriptions == {"hermes-buzz-0": CHANNEL}
+        assert adapter._membership_since == 1234
+        websocket.send.assert_not_awaited()
+        adapter._publish_directory_websocket.assert_not_awaited()
 
 
 # ── Sending ───────────────────────────────────────────────────────────────

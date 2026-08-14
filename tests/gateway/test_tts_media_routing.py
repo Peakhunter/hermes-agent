@@ -217,6 +217,7 @@ async def test_queued_followup_delivery_strips_media_tag_from_text_and_sends_ima
         extract_images=BasePlatformAdapter.extract_images,
         extract_local_files=BasePlatformAdapter.extract_local_files,
         send=AsyncMock(return_value=SendResult(success=True, message_id="text")),
+        _send_multiple_images_with_routing=AsyncMock(return_value=None),
         send_multiple_images=AsyncMock(return_value=None),
         send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
         send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
@@ -237,10 +238,12 @@ async def test_queued_followup_delivery_strips_media_tag_from_text_and_sends_ima
         "Quote here",
         metadata={"thread_id": "topic-1"},
     )
-    adapter.send_multiple_images.assert_awaited_once_with(
+    adapter._send_multiple_images_with_routing.assert_awaited_once_with(
         chat_id="chat-1",
         images=[(f"file://{media_file.as_posix()}", "")],
         metadata={"thread_id": "topic-1"},
+        human_delay=0.0,
+        reply_to=event.message_id,
     )
 
 
@@ -267,6 +270,7 @@ async def test_queued_followup_delivery_reuses_routing_metadata_for_media(
         extract_images=BasePlatformAdapter.extract_images,
         extract_local_files=BasePlatformAdapter.extract_local_files,
         send=AsyncMock(return_value=SendResult(success=True, message_id="text")),
+        _send_multiple_images_with_routing=AsyncMock(return_value=None),
         send_multiple_images=AsyncMock(return_value=None),
         send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
         send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
@@ -287,10 +291,12 @@ async def test_queued_followup_delivery_reuses_routing_metadata_for_media(
         "Threaded image",
         metadata=routing_metadata,
     )
-    adapter.send_multiple_images.assert_awaited_once_with(
+    adapter._send_multiple_images_with_routing.assert_awaited_once_with(
         chat_id="chat-1",
         images=[(f"file://{media_file.as_posix()}", "")],
         metadata=routing_metadata,
+        human_delay=0.0,
+        reply_to=event.message_id,
     )
 
 

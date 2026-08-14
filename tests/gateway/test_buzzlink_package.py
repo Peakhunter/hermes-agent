@@ -76,20 +76,32 @@ def test_buzzlink_identity_and_native_subdirectory_install(tmp_path, monkeypatch
     monkeypatch.setattr(platform_registry, "_entries", {})
     monkeypatch.setattr(platform_registry, "_deferred", {})
 
-    manager = PluginManager()
-    manager.discover_and_load()
+    namespace = "hermes_plugins.hermes_buzzlink"
+    preexisting_modules = {
+        name: module
+        for name, module in list(sys.modules.items())
+        if name == namespace or name.startswith(f"{namespace}.")
+    }
+    for module_name in preexisting_modules:
+        sys.modules.pop(module_name, None)
 
-    loaded = manager._plugins["hermes-buzzlink"]
-    assert loaded.enabled is True
-    assert loaded.error is None
-    entry = platform_registry.get("buzz")
-    assert entry is not None
-    assert entry.label == "BuzzLink for Hermes"
-    assert entry.plugin_name == "hermes-buzzlink"
-    assert "buzz" not in platform_registry._deferred
+    try:
+        manager = PluginManager()
+        manager.discover_and_load()
 
-    for module_name in list(sys.modules):
-        if module_name == "hermes_plugins.hermes_buzzlink" or module_name.startswith(
-            "hermes_plugins.hermes_buzzlink."
-        ):
-            sys.modules.pop(module_name, None)
+        loaded = manager._plugins["hermes-buzzlink"]
+        assert loaded.enabled is True
+        assert loaded.error is None
+        entry = platform_registry.get("buzz")
+        assert entry is not None
+        assert entry.label == "BuzzLink for Hermes"
+        assert entry.plugin_name == "hermes-buzzlink"
+        assert "buzz" not in platform_registry._deferred
+        adapter_module = sys.modules[entry.adapter_factory.__module__]
+        assert adapter_module.__file__ is not None
+        assert Path(adapter_module.__file__).resolve().is_relative_to(target.resolve())
+    finally:
+        for module_name in list(sys.modules):
+            if module_name == namespace or module_name.startswith(f"{namespace}."):
+                sys.modules.pop(module_name, None)
+        sys.modules.update(preexisting_modules)

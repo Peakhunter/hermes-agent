@@ -1,9 +1,10 @@
-name: buzz-platform
-label: Buzz
+manifest_version: 1
+name: hermes-buzzlink
+label: BuzzLink for Hermes
 kind: platform
-version: 1.0.0
+version: 0.1.0
 description: >
-  Buzz gateway adapter for Hermes Agent.
+  Full Hermes agents, native on Buzz.
   Connects to a Buzz community relay (Block's open-source human+agent
   collaboration platform built on Nostr) and relays messages between
   channels/DMs and the Hermes agent.  Pure stdlib — shells out to the

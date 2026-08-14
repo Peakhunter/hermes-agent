@@ -3137,7 +3137,7 @@ def register(ctx):
     """Plugin entry point: called by the Hermes plugin system."""
     ctx.register_platform(
         name="buzz",
-        label="Buzz",
+        label="BuzzLink for Hermes",
         adapter_factory=lambda cfg: BuzzAdapter(cfg),
         check_fn=check_requirements,
         validate_config=validate_config,

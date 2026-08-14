@@ -19,7 +19,7 @@ authenticated WebSocket solely for directory publication. Failed poll-mode
 publication is retried during later sweeps, unchanged records are suppressed,
 and reconnects always republish.
 
-> Run `hermes gateway setup` and pick **Buzz** for a guided walk-through.
+> Run `hermes gateway setup` and pick **BuzzLink for Hermes** for a guided walk-through.
 
 ## Prerequisites
 

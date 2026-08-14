@@ -13,6 +13,15 @@ Version 0.1 targets the tested Peakhunter Hermes integration line first. The
 plugin keeps the stable Gateway platform identifier `buzz` and the existing
 `BUZZ_*` configuration keys.
 
+Bundled discovery intentionally derives that Gateway id from the plugin
+directory basename (`plugins/platforms/buzz`), independently of the branded
+manifest name `hermes-buzzlink`. Operators upgrading from the legacy
+`buzz-platform` identity must migrate `plugins.enabled`, `plugins.disabled`,
+and the `plugins.entries.buzz-platform` mapping key to `hermes-buzzlink`; the
+`gateway.platforms.buzz` key remains unchanged. Repository-subdirectory
+installations require a force reinstall because their installed copy has no
+`.git` metadata for the normal plugin update path.
+
 The tested host supplies two generic platform contracts used for live access
 policy:
 

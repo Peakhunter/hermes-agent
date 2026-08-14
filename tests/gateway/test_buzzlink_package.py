@@ -26,6 +26,45 @@ class InstalledBuzzLink:
 
 
 @pytest.fixture
+def bundled_buzzlink(tmp_path, monkeypatch):
+    """Discover only the bundled BuzzLink manifest without leaking registries."""
+    from gateway.platform_registry import platform_registry
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginManager
+
+    bundled_root = tmp_path / "bundled"
+    shutil.copytree(
+        BUZZ_PLUGIN,
+        bundled_root / "platforms" / "buzz",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(plugins_mod, "get_bundled_plugins_dir", lambda: bundled_root)
+    monkeypatch.setattr(platform_registry, "_entries", {})
+    monkeypatch.setattr(platform_registry, "_deferred", {})
+
+    manager = PluginManager()
+    manager.discover_and_load()
+    return manager, platform_registry
+
+
+def test_bundled_buzzlink_discovery_uses_directory_basename_and_branded_key(
+    bundled_buzzlink,
+):
+    """Bundled discovery keeps plugin identity separate from platform identity."""
+    manager, platform_registry = bundled_buzzlink
+
+    assert set(manager._plugins) == {"hermes-buzzlink"}
+    loaded = manager._plugins["hermes-buzzlink"]
+    assert loaded.manifest.name == "hermes-buzzlink"
+    assert Path(loaded.manifest.path).name == "buzz"
+    assert loaded.deferred is True
+    assert set(platform_registry._deferred) == {"buzz"}
+
+
+@pytest.fixture
 def installed_buzzlink(tmp_path, monkeypatch):
     """Install and load BuzzLink through the real external-plugin path."""
     if shutil.which("git") is None:
@@ -63,18 +102,7 @@ def installed_buzzlink(tmp_path, monkeypatch):
         force=False,
     )
 
-    assert manifest["manifest_version"] == 1
-    assert manifest["name"] == "hermes-buzzlink"
-    assert manifest["label"] == "BuzzLink for Hermes"
-    assert manifest["version"] == "0.1.0"
-    assert installed_name == "hermes-buzzlink"
-    assert target == install_root / "hermes-buzzlink"
-    assert (target / "README.md").is_file()
-    assert (target / "COMPATIBILITY.md").is_file()
-
-    # Exercise the installed copy through the real user-plugin loader while the
-    # bundled Buzz platform is also discoverable. Isolated registry dictionaries
-    # cover the real collision path without leaking entries into other tests.
+    # Exercise the installed copy through the real user-plugin loader.
     (home / "config.yaml").write_text(
         "plugins:\n  enabled:\n    - hermes-buzzlink\n",
         encoding="utf-8",
@@ -82,8 +110,12 @@ def installed_buzzlink(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
 
     from gateway.platform_registry import platform_registry
+    from hermes_cli import plugins as plugins_mod
     from hermes_cli.plugins import PluginManager
 
+    empty_bundled = tmp_path / "empty-bundled"
+    empty_bundled.mkdir()
+    monkeypatch.setattr(plugins_mod, "get_bundled_plugins_dir", lambda: empty_bundled)
     monkeypatch.setattr(platform_registry, "_entries", {})
     monkeypatch.setattr(platform_registry, "_deferred", {})
 
@@ -101,17 +133,8 @@ def installed_buzzlink(tmp_path, monkeypatch):
         manager.discover_and_load()
 
         loaded = manager._plugins["hermes-buzzlink"]
-        assert loaded.enabled is True
-        assert loaded.error is None
         entry = platform_registry.get("buzz")
-        assert entry is not None
-        assert entry.label == "BuzzLink for Hermes"
-        assert entry.plugin_name == "hermes-buzzlink"
-        assert "buzz" not in platform_registry._deferred
-        adapter_module = sys.modules[entry.adapter_factory.__module__]
-        assert adapter_module.__file__ is not None
-        assert Path(adapter_module.__file__).resolve().is_relative_to(target.resolve())
-        yield InstalledBuzzLink(target, manifest, installed_name, entry)
+        yield InstalledBuzzLink(target, manifest, installed_name, entry), loaded
     finally:
         for module_name in list(sys.modules):
             if module_name == namespace or module_name.startswith(f"{namespace}."):
@@ -121,13 +144,25 @@ def installed_buzzlink(tmp_path, monkeypatch):
 
 def test_buzzlink_identity_and_native_subdirectory_install(installed_buzzlink):
     """The branded package installs independently without changing platform id."""
-    installed = installed_buzzlink
+    installed, loaded = installed_buzzlink
     assert installed.manifest["manifest_version"] == 1
     assert installed.manifest["name"] == "hermes-buzzlink"
     assert installed.manifest["label"] == "BuzzLink for Hermes"
     assert installed.manifest["version"] == "0.1.0"
     assert installed.installed_name == "hermes-buzzlink"
     assert installed.target.name == "hermes-buzzlink"
+    assert (installed.target / "README.md").is_file()
+    assert (installed.target / "COMPATIBILITY.md").is_file()
+    assert loaded.enabled is True
+    assert loaded.error is None
+    assert installed.entry is not None
+    assert installed.entry.label == "BuzzLink for Hermes"
+    assert installed.entry.plugin_name == "hermes-buzzlink"
+    adapter_module = sys.modules[installed.entry.adapter_factory.__module__]
+    assert adapter_module.__file__ is not None
+    assert Path(adapter_module.__file__).resolve().is_relative_to(
+        installed.target.resolve()
+    )
 
 
 @pytest.mark.asyncio
@@ -138,7 +173,8 @@ async def test_installed_buzzlink_native_gateway_reply_uses_inbound_event_parent
     from gateway.config import PlatformConfig
     from gateway.platforms.base import MessageEvent
 
-    adapter = installed_buzzlink.entry.adapter_factory(
+    installed, _loaded = installed_buzzlink
+    adapter = installed.entry.adapter_factory(
         PlatformConfig(enabled=True, extra={"relay_url": "https://test.relay"})
     )
     self_pubkey = "9fd5c7ba6d3ef224da78f541e0fcb9c50f72cc63edb19aae76ac6a0474dfa860"

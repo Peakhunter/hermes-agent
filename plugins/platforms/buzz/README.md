@@ -33,10 +33,32 @@ The adapter requires the `buzz` CLI binary on `PATH` (or configured with
 Hermes Buzz setup flow. The installed plugin identifier is `hermes-buzzlink`;
 the stable Gateway platform identifier remains `buzz`.
 
-If an earlier repository-subdirectory install used the legacy plugin identifier
-`buzz-platform`, install and enable `hermes-buzzlink`, verify it is active, and
-then remove the old user-installed copy. Hermes's bundled Buzz platform does
-not require this migration.
+### Migrate from `buzz-platform`
+
+The plugin identity changed at the version 0.1 boundary; the Gateway platform
+id did not. Before starting the Gateway, replace `buzz-platform` with
+`hermes-buzzlink` everywhere it appears under `plugins` in
+`~/.hermes/config.yaml`:
+
+- entries in `plugins.enabled` and `plugins.disabled`;
+- the mapping key `plugins.entries.buzz-platform`, which becomes
+  `plugins.entries.hermes-buzzlink` while retaining its nested settings.
+
+For an earlier repository-subdirectory installation, force reinstall from the
+same repository URL after making that config migration:
+
+```text
+hermes plugins install <repository-url>#plugins/platforms/buzz --force --enable
+```
+
+Do not use `hermes plugins update` for this migration. A subdirectory install
+contains the selected plugin files but no `.git` metadata, so the normal update
+path cannot pull it. The force reinstall also handles the package version reset
+or apparent downgrade that can occur when crossing from a legacy build to the
+new `hermes-buzzlink` version line. After verifying `hermes-buzzlink` is active,
+remove any remaining user-installed `buzz-platform` directory. Bundled
+operators do not reinstall, but must still migrate any legacy plugin config
+keys.
 
 ## Provenance
 

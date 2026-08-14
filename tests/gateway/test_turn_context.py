@@ -10,6 +10,8 @@ itself (that's covered by test_run_progress_topics.py et al.).
 
 import asyncio
 import queue as queue_mod
+from typing import Any, cast
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -23,7 +25,7 @@ def _make_runner(ctx):
         def _adapter_for_source(self, source):
             return None
 
-    return TurnRunner(_StubGatewayRunner(), ctx)
+    return TurnRunner(cast(Any, _StubGatewayRunner()), ctx, observer=MagicMock())
 
 
 class TestTurnContext:

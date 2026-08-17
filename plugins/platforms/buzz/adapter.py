@@ -621,16 +621,20 @@ def _load_runtime_authorization_config(profile: Optional[str] = None) -> dict:
         gateway_platforms = (
             gateway.get("platforms") if isinstance(gateway, dict) else None
         )
-        if isinstance(gateway_platforms, dict):
-            _merge(gateway_platforms.get("buzz"))
-
-        platforms = config.get("platforms")
-        if isinstance(platforms, dict):
-            _merge(platforms.get("buzz"))
-
-        if isinstance(gateway, dict):
-            _merge(gateway.get("buzz"))
-        _merge(config.get("buzz"))
+        canonical = (
+            gateway_platforms.get("buzz")
+            if isinstance(gateway_platforms, dict)
+            else None
+        )
+        if isinstance(canonical, dict):
+            _merge(canonical)
+        else:
+            platforms = config.get("platforms")
+            if isinstance(platforms, dict):
+                _merge(platforms.get("buzz"))
+            if isinstance(gateway, dict):
+                _merge(gateway.get("buzz"))
+            _merge(config.get("buzz"))
 
     policy: dict = {}
     if "allowed_users" in merged:
@@ -2805,24 +2809,49 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
     """
     merged_extra: dict = {}
 
-    def _merge_extra(candidate: Any) -> None:
+    def _extra(candidate: Any) -> dict:
         if not isinstance(candidate, dict):
-            return
+            return {}
         candidate_extra = candidate.get("extra", candidate) or {}
-        if isinstance(candidate_extra, dict):
-            merged_extra.update(candidate_extra)
+        return candidate_extra if isinstance(candidate_extra, dict) else {}
 
-    # Match gateway-loader precedence while retaining unrelated legacy values.
-    platforms_cfg = yaml_cfg.get("platforms")
-    if isinstance(platforms_cfg, dict):
-        _merge_extra(platforms_cfg.get("buzz"))
+    def _merge_extra(candidate: Any) -> None:
+        merged_extra.update(_extra(candidate))
+
+    # ``gateway.platforms.buzz`` is the canonical user-facing path exposed by
+    # the dashboard.  Keep top-level ``buzz`` as a legacy fallback, but never
+    # let it silently shadow the canonical path when both are present.
     gateway_cfg = yaml_cfg.get("gateway")
-    if isinstance(gateway_cfg, dict):
-        gateway_platforms = gateway_cfg.get("platforms")
-        if isinstance(gateway_platforms, dict):
-            _merge_extra(gateway_platforms.get("buzz"))
-    _merge_extra(yaml_cfg.get("buzz"))
-    _merge_extra(buzz_cfg)
+    gateway_platforms = (
+        gateway_cfg.get("platforms") if isinstance(gateway_cfg, dict) else None
+    )
+    canonical_cfg = (
+        gateway_platforms.get("buzz")
+        if isinstance(gateway_platforms, dict)
+        else None
+    )
+    legacy_cfg = yaml_cfg.get("buzz")
+    if (
+        canonical_cfg is not None
+        and legacy_cfg is not None
+        and _extra(legacy_cfg) != _extra(canonical_cfg)
+    ):
+        logger.warning(
+            "Buzz: conflicting legacy top-level buzz config; "
+            "gateway.platforms.buzz takes precedence"
+        )
+
+    if canonical_cfg is not None:
+        _merge_extra(canonical_cfg)
+    else:
+        # Preserve the former merge behavior only for legacy-only setups.
+        _merge_extra(buzz_cfg)
+        platforms_cfg = yaml_cfg.get("platforms")
+        if isinstance(platforms_cfg, dict):
+            _merge_extra(platforms_cfg.get("buzz"))
+        if isinstance(gateway_cfg, dict):
+            _merge_extra(gateway_cfg.get("buzz"))
+        _merge_extra(legacy_cfg)
 
     extra = merged_extra
     if not extra:

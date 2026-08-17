@@ -227,7 +227,7 @@ class TestBuzzAdapterInit:
             "allow_all_users": True,
         }
 
-    def test_runtime_authorization_config_uses_gateway_precedence(
+    def test_runtime_authorization_config_uses_canonical_gateway_platform(
         self, monkeypatch, tmp_path
     ):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -237,22 +237,24 @@ class TestBuzzAdapterInit:
             "    buzz:\n"
             "      extra:\n"
             f"        allowed_users: [{OTHER_PUBKEY}]\n"
+            "        allow_all_users: false\n"
             "  buzz:\n"
             "    extra:\n"
             "      allow_all_users: true\n"
             "platforms:\n"
             "  buzz:\n"
             "    extra:\n"
-            "      allow_all_users: false\n"
+            "      allow_all_users: true\n"
             "buzz:\n"
             "  extra:\n"
-            f"    allowed_users: [{SELF_NPUB}]\n",
+            f"    allowed_users: [{SELF_NPUB}]\n"
+            "    allow_all_users: true\n",
             encoding="utf-8",
         )
 
         assert _buzz_mod._load_runtime_authorization_config() == {
-            "allowed_users": [SELF_PUBKEY],
-            "allow_all_users": True,
+            "allowed_users": [OTHER_PUBKEY],
+            "allow_all_users": False,
         }
 
     def test_runtime_authorization_config_retains_last_valid_policy(
@@ -374,6 +376,57 @@ class TestBuzzAdapterInit:
         assert "BUZZ_RELAY_URL" not in os.environ
         assert "BUZZ_ALLOWED_USERS" not in os.environ
         assert "BUZZ_ALLOW_ALL_USERS" not in os.environ
+
+    def test_nested_buzz_config_wins_and_warns_on_legacy_conflict(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        from agent import secret_scope as ss
+        from gateway.config import Platform, load_gateway_config
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "buzz:\n"
+            "  extra:\n"
+            "    relay_url: http://legacy.relay\n"
+            "gateway:\n"
+            "  platforms:\n"
+            "    buzz:\n"
+            "      enabled: true\n"
+            "      extra:\n"
+            "        relay_url: https://canonical.relay\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1test")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({})
+        try:
+            config = load_gateway_config()
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+
+        buzz = config.platforms[Platform("buzz")]
+        assert buzz.extra["relay_url"] == "https://canonical.relay"
+        assert "conflicting legacy top-level buzz config" in caplog.text
+
+    def test_canonical_only_buzz_config_does_not_warn(self, monkeypatch, caplog):
+        canonical = {
+            "enabled": True,
+            "extra": {"relay_url": "https://canonical.relay"},
+        }
+        monkeypatch.setattr(
+            _buzz_mod, "_profile_scoped_config_load", lambda: True
+        )
+
+        extra = _buzz_mod._apply_yaml_config(
+            {"gateway": {"platforms": {"buzz": canonical}}},
+            canonical,
+        )
+
+        assert extra["relay_url"] == "https://canonical.relay"
+        assert "conflicting legacy" not in caplog.text
 
 
 # ── CLI error contract ────────────────────────────────────────────────────

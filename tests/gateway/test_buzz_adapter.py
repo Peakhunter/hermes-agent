@@ -6,6 +6,7 @@ import json
 import stat
 from collections import OrderedDict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -49,6 +50,8 @@ _ENV_VARS = (
     "BUZZ_POLL_INTERVAL",
     "BUZZ_CLI_PATH",
     "BUZZ_CREDENTIALS_FILE",
+    "BUZZ_REQUIRE_MENTION",
+    "BUZZ_THREAD_REQUIRE_MENTION",
 )
 
 
@@ -537,7 +540,7 @@ async def test_nip10_root_tag_reaches_plugin_dispatch_as_thread_root():
         "id": "reply-event",
         "kind": 9,
         "pubkey": OTHER_PUBKEY,
-        "content": "follow-up",
+        "content": "@Chip follow-up",
         "created_at": 2,
         "tags": [
             ["h", CHANNEL],
@@ -573,7 +576,7 @@ async def test_legacy_two_unmarked_e_tags_use_first_as_stable_root():
             "id": "nested-reply",
             "kind": 9,
             "pubkey": OTHER_PUBKEY,
-            "content": "legacy positional reply",
+            "content": "@Chip legacy positional reply",
             "created_at": 3,
             "tags": [["e", "root-event"], ["e", "parent-event"]],
         },
@@ -792,7 +795,7 @@ async def test_concurrent_channel_messages_cannot_exchange_thread_roots():
             "id": message_id,
             "kind": 9,
             "pubkey": sender,
-            "content": "follow-up",
+            "content": "@Chip follow-up",
             "created_at": 2,
             "tags": [["e", root_id, "", "root"]],
         }
@@ -871,10 +874,10 @@ async def test_protected_relay_image_is_authenticated_cached_and_dispatched(
     adapter = _make_adapter(
         extra={
             "relay_url": "https://relay.invalid",
-            "allowed_users": [OTHER_PUBKEY],
             "require_mention": True,
         }
     )
+    adapter.set_authorization_check(lambda *_args: True)
     received = []
     calls = []
 
@@ -920,6 +923,313 @@ async def test_protected_relay_image_is_authenticated_cached_and_dispatched(
         ["media", "get", image_url, "--output", media_calls[0][-1]]
     ]
     assert not Path(calls[0][-1]).exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("authorized", "expected_dispatches", "expected_downloads"),
+    [(True, 1, 1), (False, 0, 0)],
+    ids=("effective-grant", "effective-denial"),
+)
+async def test_protected_media_and_dispatch_share_gateway_effective_authorization(
+    authorized, expected_dispatches, expected_downloads
+):
+    adapter = _make_adapter(extra={"relay_url": "https://relay.invalid"})
+    image_url = "https://relay.invalid/media/" + ("a" * 64) + ".png"
+    downloads = []
+    dispatches = []
+
+    adapter.set_authorization_check(
+        lambda user_id, chat_type, chat_id: authorized
+    )
+
+    async def run_cli(args, **_kwargs):
+        downloads.append(list(args))
+        return 1, "", "denied"
+
+    async def capture(event):
+        if adapter._is_sender_authorized(
+            event.source.user_id, event.source.chat_type, event.source.chat_id
+        ) is True:
+            dispatches.append(event)
+
+    adapter._run_cli = run_cli
+    adapter.set_message_handler(capture)
+    adapter.handle_message = capture
+    adapter.send_reaction = AsyncMock()
+
+    await adapter._dispatch_message(
+        text=f"inspect ![image]({image_url})",
+        chat_id=CHANNEL,
+        chat_type="group",
+        user_id=OTHER_PUBKEY,
+        user_name="Alice",
+        message_id="image-event",
+        created_at=1,
+    )
+
+    media_downloads = [call for call in downloads if call[:2] == ["media", "get"]]
+    assert len(media_downloads) == expected_downloads
+    assert len(dispatches) == expected_dispatches
+
+
+@pytest.mark.asyncio
+async def test_protected_media_authorization_acquisition_failure_denies_dispatch_and_download():
+    adapter = _make_adapter(extra={"relay_url": "https://relay.invalid"})
+    adapter.set_authorization_check(
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("policy unavailable"))
+    )
+    adapter._run_cli = AsyncMock(side_effect=AssertionError("download must not run"))
+    dispatches = []
+
+    async def capture(event):
+        if adapter._is_sender_authorized(
+            event.source.user_id, event.source.chat_type, event.source.chat_id
+        ) is True:
+            dispatches.append(event)
+
+    adapter.set_message_handler(capture)
+    adapter.handle_message = capture
+    adapter.send_reaction = AsyncMock()
+
+    await adapter._dispatch_message(
+        text="inspect ![image](https://relay.invalid/media/" + ("a" * 64) + ".png)",
+        chat_id=CHANNEL,
+        chat_type="group",
+        user_id=OTHER_PUBKEY,
+        user_name="Alice",
+        message_id="image-event",
+        created_at=1,
+    )
+
+    adapter._run_cli.assert_not_awaited()
+    assert dispatches == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("grant", "expected"),
+    [
+        ("buzz-policy", True),
+        ("global-allowlist", True),
+        ("global-wildcard", True),
+        ("global-allow-all", True),
+        ("pairing", True),
+        ("secondary-transport-profile", True),
+        ("unauthorized", False),
+        ("acquisition-failure", False),
+    ],
+)
+async def test_effective_gateway_authorization_matrix_gates_dispatch_and_download(
+    monkeypatch, grant, expected
+):
+    from gateway.authz_mixin import GatewayAuthorizationMixin
+    from gateway.platform_registry import platform_registry
+    from gateway.session import SessionSource
+
+    for name in (
+        "BUZZ_ALLOWED_USERS", "BUZZ_ALLOW_ALL_USERS",
+        "GATEWAY_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    adapter = _make_adapter(extra={"relay_url": "https://relay.invalid"})
+    owner_profile = "secondary" if grant == "secondary-transport-profile" else None
+    policy_profiles = []
+
+    def policy_resolver(profile):
+        policy_profiles.append(profile)
+        if grant == "acquisition-failure":
+            raise RuntimeError("policy unavailable")
+        return {
+            "allowed_users": [OTHER_PUBKEY] if grant in {
+                "buzz-policy", "secondary-transport-profile"
+            } else [],
+            "allow_all_users": False,
+        }
+
+    plugin_entry = SimpleNamespace(
+        allowed_users_env="BUZZ_ALLOWED_USERS",
+        allow_all_env="BUZZ_ALLOW_ALL_USERS",
+        authorization_config_fn=policy_resolver,
+        authorization_user_normalizer=_normalize_user_ref,
+    )
+    monkeypatch.setattr(platform_registry, "get", lambda _name: plugin_entry)
+    if grant == "global-allowlist":
+        monkeypatch.setenv("GATEWAY_ALLOWED_USERS", hex_to_npub(OTHER_PUBKEY))
+    elif grant == "global-wildcard":
+        monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "*")
+    elif grant == "global-allow-all":
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+
+    class Pairing:
+        def is_approved(self, platform, user_id):
+            assert platform == "buzz"
+            assert user_id == OTHER_PUBKEY
+            return grant == "pairing"
+
+    class Runner(GatewayAuthorizationMixin):
+        adapters: dict
+        _profile_adapters: dict
+        pairing_store: object
+        pairing_stores: dict
+
+    runner = Runner()
+    runner.adapters = {adapter.platform: adapter}
+    runner._profile_adapters = (
+        {"secondary": {adapter.platform: adapter}} if owner_profile else {}
+    )
+    runner.pairing_store = Pairing()
+    runner.pairing_stores = {"secondary": Pairing()} if owner_profile else {}
+
+    def effective_authorization(user_id, chat_type=None, chat_id=None):
+        return runner._is_user_authorized(SessionSource(
+            platform=adapter.platform,
+            chat_id=chat_id or CHANNEL,
+            chat_type=chat_type or "group",
+            user_id=user_id,
+            profile=owner_profile,
+        ))
+
+    adapter.set_authorization_check(effective_authorization)
+    downloads = []
+    dispatches = []
+
+    async def run_cli(args, **_kwargs):
+        downloads.append(list(args))
+        return 1, "", "denied"
+
+    async def central_dispatch(event):
+        if effective_authorization(
+            event.source.user_id, event.source.chat_type, event.source.chat_id
+        ):
+            dispatches.append(event)
+
+    adapter._run_cli = run_cli
+    adapter.set_message_handler(central_dispatch)
+    adapter.handle_message = central_dispatch
+    adapter.send_reaction = AsyncMock()
+    await adapter._dispatch_message(
+        text="inspect ![image](https://relay.invalid/media/" + ("a" * 64) + ".png)",
+        chat_id=CHANNEL,
+        chat_type="group",
+        user_id=OTHER_PUBKEY,
+        user_name="Alice",
+        message_id="matrix-event",
+        created_at=1,
+    )
+
+    assert len(dispatches) == int(expected)
+    assert len([call for call in downloads if call[:2] == ["media", "get"]]) == int(expected)
+    if owner_profile:
+        assert policy_profiles and set(policy_profiles) == {"secondary"}
+
+
+@pytest.mark.asyncio
+async def test_protected_media_environment_override_denies_before_download(
+    monkeypatch, tmp_path
+):
+    from plugins.platforms.buzz import settings
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "gateway:\n"
+        "  platforms:\n"
+        "    buzz:\n"
+        "      extra:\n"
+        f"        allowed_users: [{OTHER_PUBKEY}]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    assert settings.effective_runtime_policy()["allowed_users"] == [OTHER_PUBKEY]
+    monkeypatch.setenv("BUZZ_ALLOWED_USERS", "")
+    assert settings.effective_runtime_policy()["allowed_users"] == []
+    monkeypatch.setattr(_buzz_mod, "_load_settings", lambda: settings)
+    adapter = _make_adapter(extra={"relay_url": "https://relay.invalid"})
+    adapter._run_cli = AsyncMock(side_effect=AssertionError("download must not run"))
+    adapter._message_handler = AsyncMock()
+    adapter.handle_message = AsyncMock()
+    adapter.send_reaction = AsyncMock()
+
+    await adapter._dispatch_message(
+        text="inspect ![image](https://relay.invalid/media/" + ("a" * 64) + ".png)",
+        chat_id=CHANNEL,
+        chat_type="group",
+        user_id=OTHER_PUBKEY,
+        user_name="Alice",
+        message_id="image-event",
+        created_at=1,
+    )
+
+    adapter._run_cli.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_protected_media_live_grant_and_revocation_apply_without_reconstruction(
+    monkeypatch
+):
+    adapter = _make_adapter(extra={"relay_url": "https://relay.invalid"})
+    current_policy = {"allowed_users": [], "allow_all_users": False}
+    adapter.set_authorization_check(
+        lambda user_id, *_args: current_policy["allow_all_users"]
+        or user_id in current_policy["allowed_users"]
+    )
+    downloads = []
+
+    async def run_cli(args, **_kwargs):
+        downloads.append(list(args))
+        return 1, "", "denied"
+
+    adapter._run_cli = run_cli
+    adapter._message_handler = AsyncMock()
+    adapter.handle_message = AsyncMock()
+    adapter.send_reaction = AsyncMock()
+    text = "inspect ![image](https://relay.invalid/media/" + ("a" * 64) + ".png)"
+
+    for message_id in ("denied", "granted", "revoked"):
+        if message_id == "granted":
+            current_policy["allowed_users"] = [OTHER_PUBKEY]
+        elif message_id == "revoked":
+            current_policy["allowed_users"] = []
+        await adapter._dispatch_message(
+            text=text,
+            chat_id=CHANNEL,
+            chat_type="group",
+            user_id=OTHER_PUBKEY,
+            user_name="Alice",
+            message_id=message_id,
+            created_at=1,
+        )
+
+    media_downloads = [call for call in downloads if call[:2] == ["media", "get"]]
+    assert len(media_downloads) == 1
+
+
+@pytest.mark.asyncio
+async def test_protected_media_policy_loader_failure_denies_before_download(monkeypatch):
+    adapter = _make_adapter(extra={"relay_url": "https://relay.invalid"})
+
+    def fail_loader():
+        raise RuntimeError("policy unavailable")
+
+    monkeypatch.setattr(_buzz_mod, "_load_settings", fail_loader)
+    adapter._run_cli = AsyncMock(side_effect=AssertionError("download must not run"))
+    adapter._message_handler = AsyncMock()
+    adapter.handle_message = AsyncMock()
+    adapter.send_reaction = AsyncMock()
+
+    await adapter._dispatch_message(
+        text="inspect ![image](https://relay.invalid/media/" + ("a" * 64) + ".png)",
+        chat_id=CHANNEL,
+        chat_type="group",
+        user_id=OTHER_PUBKEY,
+        user_name="Alice",
+        message_id="image-event",
+        created_at=1,
+    )
+
+    adapter._run_cli.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1173,16 +1483,22 @@ async def test_oversized_protected_image_is_not_cached_or_removed(monkeypatch, t
 
 
 @pytest.mark.asyncio
-async def test_unauthorized_image_message_is_not_downloaded():
+async def test_unauthorized_image_message_is_not_downloaded(monkeypatch):
     sender = "a" * 64
     image_url = "https://relay.invalid/media/" + ("b" * 64) + ".png"
     adapter = _make_adapter(
         extra={
             "relay_url": "https://relay.invalid",
-            "allowed_users": ["c" * 64],
             "require_mention": True,
         }
     )
+    policy_api = MagicMock()
+    policy_api.effective_runtime_policy.return_value = {
+        "allowed_users": ["c" * 64],
+        "allow_all_users": False,
+    }
+    policy_api.normalize_user_ref.side_effect = _normalize_user_ref
+    monkeypatch.setattr(_buzz_mod, "_load_settings", lambda: policy_api)
     adapter._user_names[sender] = "Alice"
     received = []
 
@@ -1193,6 +1509,7 @@ async def test_unauthorized_image_message_is_not_downloaded():
         received.append(event)
 
     adapter._run_cli = run_cli
+    adapter.send_reaction = AsyncMock()
     adapter.set_message_handler(capture)
     adapter.handle_message = capture
     state = {"chat_type": "group", "last_ts": 0, "seen": OrderedDict()}
@@ -1210,7 +1527,10 @@ async def test_unauthorized_image_message_is_not_downloaded():
         },
     )
 
-    assert received == []
+    assert len(received) == 1
+    assert received[0].message_type is _buzz_mod.MessageType.TEXT
+    assert received[0].media_urls == []
+    assert image_url in received[0].text
 
 # ── Seeding / high-water mark / de-dupe ───────────────────────────────────
 
@@ -1304,10 +1624,140 @@ class TestMentionGating:
 
 
     @pytest.mark.asyncio
-    async def test_allowlist_blocks_unauthorized(self, adapter):
+    async def test_shared_channel_mention_policy_reloads_and_key_deletion_defaults_true(
+        self, adapter, monkeypatch, tmp_path
+    ):
+        from plugins.platforms.buzz import settings
+
+        home = tmp_path / "hermes"
+        home.mkdir()
+        config_path = home / "config.yaml"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(_buzz_mod, "_load_settings", lambda: settings)
+
+        def save(extra):
+            replacement = config_path.with_suffix(".yaml.next")
+            replacement.write_text(
+                "gateway:\n  platforms:\n    buzz:\n      extra:\n"
+                + "".join(f"        {key}: {str(value).lower()}\n" for key, value in extra.items()),
+                encoding="utf-8",
+            )
+            replacement.replace(config_path)
+
+        save({"require_mention": True})
+        await self._poll_with(adapter, _event("e1", content="first", created_at=10))
+        assert adapter._dispatched == []
+
+        save({"require_mention": False})
+        await self._poll_with(adapter, _event("e2", content="second", created_at=11))
+        assert [event["message_id"] for event in adapter._dispatched] == ["e2"]
+
+        save({})
+        await self._poll_with(adapter, _event("e3", content="third", created_at=12))
+        assert [event["message_id"] for event in adapter._dispatched] == ["e2"]
+
+
+    @pytest.mark.asyncio
+    async def test_thread_mention_policy_is_live_strict_and_independent(
+        self, adapter, monkeypatch, tmp_path
+    ):
+        from plugins.platforms.buzz import settings
+
+        home = tmp_path / "hermes"
+        home.mkdir()
+        config_path = home / "config.yaml"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(_buzz_mod, "_load_settings", lambda: settings)
+
+        def save(*, include_thread, thread_value=False):
+            thread_line = (
+                f"        thread_require_mention: {str(thread_value).lower()}\n"
+                if include_thread
+                else ""
+            )
+            replacement = config_path.with_suffix(".yaml.next")
+            replacement.write_text(
+                "gateway:\n  platforms:\n    buzz:\n      extra:\n"
+                "        require_mention: false\n"
+                + thread_line,
+                encoding="utf-8",
+            )
+            replacement.replace(config_path)
+
+        def reply(event_id, created_at):
+            event = _event(event_id, content="follow-up", created_at=created_at)
+            event["tags"].extend(
+                [["e", "root-event", "", "root"], ["e", "parent-event", "", "reply"]]
+            )
+            return event
+
+        save(include_thread=False)
+        await self._poll_with(adapter, reply("e1", 10))
+        assert adapter._dispatched == []
+
+        save(include_thread=True, thread_value=False)
+        await self._poll_with(adapter, reply("e2", 11))
+        assert [event["message_id"] for event in adapter._dispatched] == ["e2"]
+
+        save(include_thread=False)
+        await self._poll_with(adapter, reply("e3", 12))
+        await self._poll_with(adapter, _event("e4", content="top level", created_at=13))
+        assert [event["message_id"] for event in adapter._dispatched] == ["e2", "e4"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("tags", "dispatches"),
+        [
+            (["e", "root-event", "", "root"], False),
+            (
+                [
+                    ["e", "root-event", "", "root"],
+                    ["e", "parent-event", "", "reply"],
+                ],
+                False,
+            ),
+            (["e", "parent-event", "", "reply"], False),
+            (["e", "legacy-root"], False),
+            ([["e", "legacy-root"], ["e", "legacy-parent"]], False),
+            (["e", ""], True),
+            (["p", SELF_PUBKEY], True),
+        ],
+        ids=(
+            "marked-root",
+            "marked-root-and-reply",
+            "direct-reply-only",
+            "legacy-one-e-tag",
+            "legacy-first-of-multiple-e-tags",
+            "malformed-empty-e-tag",
+            "top-level",
+        ),
+    )
+    async def test_structural_thread_root_selects_thread_mention_policy(
+        self, adapter, monkeypatch, tags, dispatches
+    ):
+        monkeypatch.setattr(
+            _buzz_mod,
+            "_effective_runtime_policy",
+            lambda: {
+                "allowed_users": [],
+                "allow_all_users": False,
+                "require_mention": False,
+                "thread_require_mention": True,
+            },
+        )
+        event = _event("event", content="unmentioned", created_at=10)
+        event["tags"] = tags if tags and isinstance(tags[0], list) else [tags]
+
+        await self._poll_with(adapter, event)
+
+        assert bool(adapter._dispatched) is dispatches
+
+
+    @pytest.mark.asyncio
+    async def test_construction_time_allowlist_does_not_gate_dispatch(self, adapter):
         adapter._allowed_pubkeys = {"b" * 64}
         await self._poll_with(adapter, _event("e1", content="@Chip hello", created_at=10))
-        assert adapter._dispatched == []
+        assert [event["message_id"] for event in adapter._dispatched] == ["e1"]
 
 
 # ── DM classification via p-tags (issue #68871) ──────────────────────────

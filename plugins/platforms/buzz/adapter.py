@@ -495,6 +495,23 @@ def _resolve_private_key(extra: Optional[dict] = None) -> str:
     return ""
 
 
+def _close_subprocess_transport(proc: Any) -> None:
+    """Close asyncio's subprocess transport after abnormal child teardown.
+
+    ``Process.wait()`` reaps the child but does not guarantee that the private
+    transport holding its pipe descriptors is closed immediately.  Timeout and
+    cancellation paths are descriptor-pressure paths, so close that transport
+    explicitly without allowing cleanup failure to replace the original error.
+    """
+    transport = getattr(proc, "_transport", None)
+    if transport is None:
+        return
+    try:
+        transport.close()
+    except Exception:
+        logger.debug("Buzz: failed to close subprocess transport", exc_info=True)
+
+
 async def _exec_buzz(
     cli_path: str,
     args: List[str],
@@ -528,7 +545,10 @@ async def _exec_buzz(
         )
     except asyncio.TimeoutError:
         proc.kill()
-        await proc.wait()
+        try:
+            await proc.wait()
+        finally:
+            _close_subprocess_transport(proc)
         return 124, "", json.dumps(
             {
                 "error": "timeout",
@@ -539,7 +559,10 @@ async def _exec_buzz(
     except asyncio.CancelledError:
         if proc.returncode is None:
             proc.kill()
-        await asyncio.shield(proc.wait())
+        try:
+            await asyncio.shield(proc.wait())
+        finally:
+            _close_subprocess_transport(proc)
         raise
     return (
         proc.returncode if proc.returncode is not None else 4,
@@ -594,10 +617,13 @@ async def _exec_buzz_media(
         returncode = await asyncio.wait_for(copy_stdout(), timeout=timeout)
         stderr = await stderr_task
     except asyncio.TimeoutError:
-        if proc.returncode is None:
-            proc.kill()
-        await proc.wait()
-        await asyncio.gather(stderr_task, return_exceptions=True)
+        try:
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
+            await asyncio.gather(stderr_task, return_exceptions=True)
+        finally:
+            _close_subprocess_transport(proc)
         output_path.unlink(missing_ok=True)
         return 124, json.dumps(
             {
@@ -607,11 +633,14 @@ async def _exec_buzz_media(
             }
         )
     except BaseException:
-        if proc.returncode is None:
-            proc.kill()
-        await asyncio.shield(proc.wait())
-        stderr_task.cancel()
-        await asyncio.gather(stderr_task, return_exceptions=True)
+        try:
+            if proc.returncode is None:
+                proc.kill()
+            await asyncio.shield(proc.wait())
+            stderr_task.cancel()
+            await asyncio.gather(stderr_task, return_exceptions=True)
+        finally:
+            _close_subprocess_transport(proc)
         output_path.unlink(missing_ok=True)
         raise
     return returncode, stderr.decode("utf-8", errors="replace")

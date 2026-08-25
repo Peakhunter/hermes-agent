@@ -475,6 +475,98 @@ async def test_exec_buzz_cancellation_kills_and_reaps_child(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_exec_buzz_timeout_closes_subprocess_transport(monkeypatch):
+    class Transport:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    class Process:
+        def __init__(self):
+            self.returncode = None
+            self._transport = Transport()
+
+        async def communicate(self, _input):
+            await asyncio.sleep(60)
+
+        def kill(self):
+            self.returncode = -signal.SIGKILL
+
+        async def wait(self):
+            return self.returncode
+
+    process = Process()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    returncode, _stdout, _stderr = await _buzz_mod._exec_buzz(
+        "buzz",
+        ["channels", "list"],
+        relay_url="https://relay.invalid",
+        private_key="test-key",
+        timeout=0.001,
+    )
+
+    assert returncode == 124
+    assert process._transport.closed is True
+
+
+@pytest.mark.asyncio
+async def test_exec_buzz_media_timeout_closes_subprocess_transport(monkeypatch, tmp_path):
+    class Transport:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    class Stream:
+        def __init__(self, *, blocks=False):
+            self.blocks = blocks
+
+        async def read(self, _size=-1):
+            if self.blocks:
+                await asyncio.sleep(60)
+            return b""
+
+    class Process:
+        def __init__(self):
+            self.returncode = None
+            self._transport = Transport()
+            self.stdout = Stream(blocks=True)
+            self.stderr = Stream()
+
+        def kill(self):
+            self.returncode = -signal.SIGKILL
+
+        async def wait(self):
+            return self.returncode
+
+    process = Process()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+
+    returncode, _stderr = await _buzz_mod._exec_buzz_media(
+        "buzz",
+        ["media", "get"],
+        relay_url="https://relay.invalid",
+        private_key="test-key",
+        output_path=tmp_path / "media.bin",
+        max_bytes=1024,
+        timeout=0.001,
+    )
+
+    assert returncode == 124
+    assert process._transport.closed is True
+
+
+@pytest.mark.asyncio
 async def test_exec_buzz_media_stops_before_writing_beyond_cap(tmp_path):
     output_path = tmp_path / "media.bin"
     script = "import sys,time; sys.stdout.buffer.write(b'x' * 65536); sys.stdout.flush(); time.sleep(60)"

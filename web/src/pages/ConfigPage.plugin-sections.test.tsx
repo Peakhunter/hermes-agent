@@ -102,6 +102,45 @@ describe("Config plugin sections", () => {
     );
   });
 
+  it("preserves the advertised config:top compatibility slot", async () => {
+    registerSlot(
+      "legacy-config-plugin",
+      "config:top",
+      () => <div data-testid="legacy-config-top">Legacy config extension</div>,
+    );
+
+    await act(async () => root.render(<I18nProvider><ConfigPage /></I18nProvider>));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector('[data-testid="legacy-config-top"]')?.textContent).toBe(
+      "Legacy config extension",
+    );
+    unregisterPluginSlots("legacy-config-plugin");
+  });
+
+  it("does not let a plugin section replace a core schema category", async () => {
+    registerSlot(
+      "colliding-config-plugin",
+      "config:section:general",
+      () => <div data-testid="colliding-general">Plugin takeover</div>,
+    );
+
+    await act(async () => root.render(<I18nProvider><ConfigPage /></I18nProvider>));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector('[data-testid="colliding-general"]')).toBeNull();
+    expect(container.textContent).toContain("Default model");
+    unregisterPluginSlots("colliding-config-plugin");
+  });
+
   it("restores core Save and Reset controls when searching from a plugin section", async () => {
     await act(async () => root.render(<I18nProvider><ConfigPage /></I18nProvider>));
     await act(async () => {

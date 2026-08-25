@@ -130,8 +130,16 @@ export default function ConfigPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { t } = useI18n();
   const { setEnd } = usePageHeader();
-  const pluginConfigSections = useConfigSectionNames();
+  const registeredPluginConfigSections = useConfigSectionNames();
   const pluginConfigSectionIcons = useConfigSectionIcons();
+  const coreConfigSections = new Set(
+    Object.values(schema ?? {}).map((field) =>
+      String(field.category ?? "general"),
+    ),
+  );
+  const pluginConfigSections = registeredPluginConfigSections.filter(
+    (section) => !coreConfigSections.has(section),
+  );
 
   useLayoutEffect(() => {
     if (!config || !schema) {
@@ -446,6 +454,7 @@ export default function ConfigPage() {
   return (
     <div className="flex flex-col gap-4">
       <Toast toast={toast} />
+      <PluginSlot name="config:top" />
 
       <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
         <div className="flex min-w-0 items-center gap-2 sm:flex-1">

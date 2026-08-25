@@ -33,6 +33,11 @@ TEST_PRIVATE_KEY = "00" * 31 + "03"
 CHANNEL = "ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd"
 
 
+@pytest.fixture(autouse=True)
+def _clean_transport_override(monkeypatch):
+    monkeypatch.delenv("BUZZ_TRANSPORT", raising=False)
+
+
 def _make_adapter(extra=None):
     from gateway.config import PlatformConfig
 

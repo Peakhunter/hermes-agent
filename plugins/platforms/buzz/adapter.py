@@ -111,6 +111,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     cache_image_from_bytes,
+    get_inbound_media_max_bytes,
     validate_inbound_media_size,
 )
 from gateway.config import Platform
@@ -151,7 +152,7 @@ def _cli_failure_is_retryable(stderr: str, returncode: int) -> bool:
         data = None
     if isinstance(data, dict) and isinstance(data.get("retryable"), bool):
         return data["retryable"]
-    return returncode == 2
+    return returncode in {2, 124}
 
 
 def _is_mention_continuation(char: str) -> bool:
@@ -222,7 +223,6 @@ def unresolved_mention_fallback(
 
 def buzz_event_thread_root(event: dict) -> Optional[str]:
     """Return the NIP-10 root, falling back to the direct reply target."""
-
     tags = event.get("tags")
     if not isinstance(tags, list):
         return None
@@ -244,32 +244,7 @@ def buzz_event_thread_root(event: dict) -> Optional[str]:
             unmarked.append(target)
     # Legacy positional NIP-10: first unmarked e tag is the stable root and,
     # when two or more exist, the last is the direct reply target.
-    return root or (unmarked[0] if unmarked else None) or reply
-
-def buzz_event_thread_root(event: dict) -> Optional[str]:
-    """Return the NIP-10 root, falling back to the direct reply target."""
-    tags = event.get("tags")
-    if not isinstance(tags, list):
-        return None
-    root = None
-    reply = None
-    unmarked = []
-    for tag in tags:
-        if not isinstance(tag, list) or len(tag) < 2 or tag[0] != "e":
-            continue
-        target = str(tag[1] or "").strip()
-        if not target:
-            continue
-        marker = str(tag[3] or "") if len(tag) > 3 else ""
-        if marker == "root":
-            root = target
-        elif marker == "reply":
-            reply = target
-        elif marker == "":
-            unmarked.append(target)
-    # Legacy positional NIP-10: first unmarked e tag is the stable root and,
-    # when two or more exist, the last is the direct reply target.
-    return root or (unmarked[0] if unmarked else None) or reply
+    return root or reply or (unmarked[0] if unmarked else None)
 
 
 _DEFAULT_POLL_INTERVAL = 4.0
@@ -554,12 +529,92 @@ async def _exec_buzz(
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
-        return 124, "", json.dumps({"error": "timeout", "message": f"buzz {args[0] if args else ''} timed out after {timeout}s"})
+        return 124, "", json.dumps(
+            {
+                "error": "timeout",
+                "message": f"buzz {args[0] if args else ''} timed out after {timeout}s",
+                "retryable": True,
+            }
+        )
+    except asyncio.CancelledError:
+        if proc.returncode is None:
+            proc.kill()
+        await asyncio.shield(proc.wait())
+        raise
     return (
         proc.returncode if proc.returncode is not None else 4,
         stdout.decode("utf-8", errors="replace"),
         stderr.decode("utf-8", errors="replace"),
     )
+
+
+async def _exec_buzz_media(
+    cli_path: str,
+    args: List[str],
+    *,
+    relay_url: str,
+    private_key: str,
+    output_path: Path,
+    max_bytes: int,
+    timeout: float,
+) -> Tuple[int, str]:
+    """Stream authenticated media to disk with a write-time byte bound."""
+    env = os.environ.copy()
+    env["BUZZ_RELAY_URL"] = relay_url
+    env["BUZZ_PRIVATE_KEY"] = private_key
+    proc = await asyncio.create_subprocess_exec(
+        cli_path,
+        *args,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+    stderr_task = asyncio.create_task(proc.stderr.read())
+
+    async def copy_stdout() -> int:
+        total = 0
+        with output_path.open("wb") as destination:
+            while True:
+                chunk = await proc.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                validate_inbound_media_size(
+                    total,
+                    media_type="image",
+                    max_bytes=max_bytes,
+                )
+                destination.write(chunk)
+        return await proc.wait()
+
+    try:
+        returncode = await asyncio.wait_for(copy_stdout(), timeout=timeout)
+        stderr = await stderr_task
+    except asyncio.TimeoutError:
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
+        await asyncio.gather(stderr_task, return_exceptions=True)
+        output_path.unlink(missing_ok=True)
+        return 124, json.dumps(
+            {
+                "error": "timeout",
+                "message": f"buzz {args[0] if args else ''} timed out after {timeout}s",
+                "retryable": True,
+            }
+        )
+    except BaseException:
+        if proc.returncode is None:
+            proc.kill()
+        await asyncio.shield(proc.wait())
+        stderr_task.cancel()
+        await asyncio.gather(stderr_task, return_exceptions=True)
+        output_path.unlink(missing_ok=True)
+        raise
+    return returncode, stderr.decode("utf-8", errors="replace")
 
 
 def _cli_error_message(stderr: str, returncode: int) -> str:
@@ -727,15 +782,42 @@ class BuzzAdapter(BasePlatformAdapter):
 
     # ── buzz-cli plumbing ─────────────────────────────────────────────────
 
-    async def _run_cli(self, args: List[str], *, input_text: Optional[str] = None) -> Tuple[int, str, str]:
+    async def _run_cli(
+        self,
+        args: List[str],
+        *,
+        input_text: Optional[str] = None,
+        output_path: Optional[Path] = None,
+        max_output_bytes: Optional[int] = None,
+        timeout: float = _CLI_TIMEOUT,
+    ) -> Tuple[int, str, str]:
         if not self._private_key:
             self._private_key = _resolve_private_key(self._extra)
+        if output_path is not None:
+            media_args = list(args)
+            if "--output" in media_args:
+                media_args[media_args.index("--output") + 1] = "-"
+            code, stderr = await _exec_buzz_media(
+                self.cli_path,
+                media_args,
+                relay_url=self.relay_url,
+                private_key=self._private_key,
+                output_path=output_path,
+                max_bytes=(
+                    get_inbound_media_max_bytes()
+                    if max_output_bytes is None
+                    else max_output_bytes
+                ),
+                timeout=timeout,
+            )
+            return code, "", stderr
         return await _exec_buzz(
             self.cli_path,
             args,
             relay_url=self.relay_url,
             private_key=self._private_key,
             input_text=input_text,
+            timeout=timeout,
         )
 
     # ── Connection lifecycle ──────────────────────────────────────────────
@@ -1604,7 +1686,8 @@ class BuzzAdapter(BasePlatformAdapter):
     async def _handle_membership_event(self, websocket, subscriptions: Dict[str, Optional[str]], event: dict) -> None:
         """Reconcile live subscriptions from the authoritative joined roster."""
         created_at = int(event.get("created_at") or 0)
-        self._membership_since = max(self._membership_since, created_at)
+        trustworthy_created_at = max(0, min(created_at, int(time.time())))
+        self._membership_since = max(self._membership_since, trustworthy_created_at)
         target_channel_id = ""
         for tag in event.get("tags") or []:
             if isinstance(tag, list) and len(tag) > 1 and tag[0] == "h":
@@ -1612,7 +1695,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 break
         before = set(self._channel_state)
         await self._discover_joined_channels(
-            since=created_at,
+            since=trustworthy_created_at,
             target_channel_id=target_channel_id,
         )
         for subscription_id, channel_id in list(subscriptions.items()):
@@ -2150,22 +2233,14 @@ class BuzzAdapter(BasePlatformAdapter):
             state["seen"][event_id] = None
             self._trim_seen(state)
 
-    def _media_sender_authorized(self, user_id: str) -> bool:
-        """Apply the same live policy used by gateway authorization.
-
-        Media fetches must not retain the adapter's construction-time allowlist:
-        Dashboard saves take effect without a gateway restart, including
-        revocation.  ``effective_runtime_policy`` already normalizes identities
-        and fails closed when acquisition is unavailable.
-        """
-        policy = _effective_runtime_policy()
-        if policy.get("allow_all_users") is True:
-            return True
-        allowed = policy.get("allowed_users")
-        if not isinstance(allowed, list):
-            return False
-        normalized = _normalize_user_ref(user_id)
-        return bool(normalized and normalized in allowed)
+    def _media_sender_authorized(
+        self,
+        user_id: str,
+        chat_type: str,
+        chat_id: str,
+    ) -> bool:
+        """Use the runner's complete, profile-scoped effective authorization."""
+        return self._is_sender_authorized(user_id, chat_type, chat_id) is True
 
     def _buzz_image_metadata(self, url: str) -> Optional[Tuple[str, str, str]]:
         relay = urlsplit(self.relay_url)
@@ -2246,7 +2321,10 @@ class BuzzAdapter(BasePlatformAdapter):
                         raise TimeoutError
                     code, _out, error_text = await asyncio.wait_for(
                         self._run_cli(
-                            ["media", "get", url, "--output", temporary_path]
+                            ["media", "get", url, "--output", temporary_path],
+                            output_path=Path(temporary_path),
+                            max_output_bytes=get_inbound_media_max_bytes(),
+                            timeout=remaining,
                         ),
                         timeout=remaining,
                     )
@@ -2322,7 +2400,11 @@ class BuzzAdapter(BasePlatformAdapter):
         dispatch_text = text
         media_urls: List[str] = []
         media_types: List[str] = []
-        if not getattr(source, "profile_route_rejected", False) and self._media_sender_authorized(user_id):
+        sender_authorized = (
+            not getattr(source, "profile_route_rejected", False)
+            and self._media_sender_authorized(user_id, chat_type, chat_id)
+        )
+        if sender_authorized:
             dispatch_text, media_urls, media_types = await self._ingest_buzz_images(text)
 
         event = MessageEvent(
@@ -2339,10 +2421,11 @@ class BuzzAdapter(BasePlatformAdapter):
         
         # Add a "seen" reaction after dispatching — signals to the user that
         # their message was received and is being processed.
-        try:
-            await self.send_reaction(chat_id, message_id, "👀")
-        except Exception:
-            logger.debug("Buzz: reaction failed for message %s", message_id[:12], exc_info=True)
+        if sender_authorized:
+            try:
+                await self.send_reaction(chat_id, message_id, "👀")
+            except Exception:
+                logger.debug("Buzz: reaction failed for message %s", message_id[:12], exc_info=True)
 
     def on_turn_lifecycle(self, event: Any) -> bool:
         """Translate a neutral Gateway event into encrypted Buzz activity."""

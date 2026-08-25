@@ -57,6 +57,75 @@ def test_stock_dashboard_discovers_serves_and_safely_mounts_bundled_buzz(monkeyp
     }
 
 
+def test_bundled_plugin_api_can_enable_after_dashboard_start(monkeypatch):
+    from hermes_cli import plugins_cmd, web_server
+
+    enabled = set()
+    disabled = {"buzz-platform"}
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: set(enabled))
+    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set(disabled))
+
+    web_server._refresh_plugin_api_routes("buzz-platform")
+    assert "/api/plugins/buzz-platform/policy" not in web_server.app.openapi()["paths"]
+    client = TestClient(web_server.app)
+    headers = {"X-Hermes-Session-Token": web_server._SESSION_TOKEN}
+    assert client.get(
+        "/api/plugins/buzz-platform/policy", headers=headers
+    ).status_code == 404
+
+    disabled.clear()
+    enabled.add("buzz-platform")
+    web_server._refresh_plugin_api_routes("buzz-platform")
+
+    assert "/api/plugins/buzz-platform/policy" in web_server.app.openapi()["paths"]
+    assert client.get(
+        "/api/plugins/buzz-platform/policy", headers=headers
+    ).status_code == 200
+
+
+def test_enabled_plugin_api_update_replaces_stale_routes(monkeypatch, tmp_path):
+    from hermes_cli import plugins_cmd, web_server
+
+    dashboard = tmp_path / "dashboard"
+    dashboard.mkdir()
+    api_file = dashboard / "plugin_api.py"
+    plugin = {
+        "name": "route-refresh-test",
+        "source": "user",
+        "_dir": str(dashboard),
+        "_api_file": "plugin_api.py",
+    }
+    monkeypatch.setattr(web_server, "_get_dashboard_plugins", lambda **_kwargs: [plugin])
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {plugin["name"]})
+    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
+
+    def write_version(version):
+        api_file.write_text(
+            "from fastapi import APIRouter\n"
+            "router = APIRouter()\n"
+            "@router.get('/version')\n"
+            f"def version(): return {{'version': {version!r}}}\n",
+            encoding="utf-8",
+        )
+
+    client = TestClient(web_server.app)
+    headers = {"X-Hermes-Session-Token": web_server._SESSION_TOKEN}
+    try:
+        write_version("v1")
+        web_server._refresh_plugin_api_routes(plugin["name"])
+        assert client.get(
+            f"/api/plugins/{plugin['name']}/version", headers=headers
+        ).json() == {"version": "v1"}
+
+        write_version("v2")
+        web_server._refresh_plugin_api_routes(plugin["name"])
+        assert client.get(
+            f"/api/plugins/{plugin['name']}/version", headers=headers
+        ).json() == {"version": "v2"}
+    finally:
+        web_server._unmount_plugin_api_routes(plugin["name"])
+
+
 def _run_dashboard_node(expression: str) -> dict[str, Any]:
     script = (
         "const dashboard = require('./plugins/platforms/buzz/dashboard/src/index.js');\n"

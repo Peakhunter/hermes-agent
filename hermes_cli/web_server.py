@@ -18797,6 +18797,7 @@ async def post_agent_plugin_install(request: Request, body: _AgentPluginInstallB
             detail=result.get("error") or "Install failed.",
         )
     _get_dashboard_plugins(force_rescan=True)
+    _mount_plugin_api_routes()
     _invalidate_plugins_hub_cache()
     # Strip internal paths from the response
     result.pop("after_install_path", None)
@@ -18820,6 +18821,7 @@ async def post_agent_plugin_enable(request: Request, name: str):
     result = dashboard_set_agent_plugin_enabled(name, enabled=True)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Enable failed.")
+    _refresh_plugin_api_routes(name)
     _invalidate_plugins_hub_cache()
     return result
 
@@ -18833,6 +18835,7 @@ async def post_agent_plugin_disable(request: Request, name: str):
     result = dashboard_set_agent_plugin_enabled(name, enabled=False)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Disable failed.")
+    _refresh_plugin_api_routes(name)
     _invalidate_plugins_hub_cache()
     return result
 
@@ -18847,6 +18850,7 @@ async def post_agent_plugin_update(request: Request, name: str):
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Update failed.")
     _get_dashboard_plugins(force_rescan=True)
+    _refresh_plugin_api_routes(name)
     _invalidate_plugins_hub_cache()
     return result
 
@@ -18861,6 +18865,7 @@ async def delete_agent_plugin(request: Request, name: str):
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Remove failed.")
     _get_dashboard_plugins(force_rescan=True)
+    _unmount_plugin_api_routes(name)
     _invalidate_plugins_hub_cache()
     return result
 
@@ -19004,118 +19009,137 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
     )
 
 
-def _mount_plugin_api_routes():
-    """Import and mount backend API routes from plugins that declare them.
+_PLUGIN_API_ROUTE_LOCK = threading.RLock()
+_PLUGIN_API_ROUTES: dict[str, list[Any]] = {}
+_PLUGIN_API_MODULES: dict[str, str] = {}
 
-    Each plugin's ``api`` field points to a Python file that must expose
-    a ``router`` (FastAPI APIRouter).  Routes are mounted under
-    ``/api/plugins/<name>/``.
 
-    Backend import is restricted to ``bundled`` and ``user`` sources.
-    Project plugins (``./.hermes/plugins/``) ship with the CWD and are
-    therefore attacker-controlled in any threat model where the user
-    opens a malicious repo; they can extend the dashboard UI via
-    static JS/CSS but their Python ``api`` file is never auto-imported
-    by the web server.  See GHSA-5qr3-c538-wm9j (#29156).
+def _unmount_plugin_api_routes(plugin_name: str) -> None:
+    """Remove one plugin's currently mounted API routes and module."""
+    with _PLUGIN_API_ROUTE_LOCK:
+        old_routes = _PLUGIN_API_ROUTES.pop(plugin_name, [])
+        if old_routes:
+            old_ids = {id(route) for route in old_routes}
+            app.router.routes[:] = [
+                route for route in app.router.routes if id(route) not in old_ids
+            ]
+        module_name = _PLUGIN_API_MODULES.pop(plugin_name, None)
+        if module_name:
+            sys.modules.pop(module_name, None)
+        app.openapi_schema = None
 
-    Additionally, user plugins must be explicitly enabled via the
-    ``plugins.enabled`` allow-list in config.yaml before their backend
-    code is imported. Without this gate, an installed-but-not-enabled
-    plugin's Python code would execute at dashboard startup — a code
-    execution vector that bypasses the user's intent. (#46435,
-    GHSA-mcfc-hp25-cjv7)
-    """
-    # Load the enabled/disabled sets once for the loop.
+
+def _plugin_api_is_enabled(
+    plugin: dict[str, Any], enabled_set: set[str], disabled_set: set[str]
+) -> bool:
+    plugin_name = str(plugin.get("name") or "")
+    source = plugin.get("source")
+    if source == "project":
+        return False
+    if source == "user":
+        return plugin_name in enabled_set and plugin_name not in disabled_set
+    if source == "bundled":
+        return plugin_name not in disabled_set
+    return False
+
+
+def _load_plugin_api_router(plugin: dict[str, Any]):
+    """Load one trusted plugin API module without stale bytecode reuse."""
+    plugin_name = str(plugin.get("name") or "")
+    api_file_name = plugin.get("_api_file")
+    dashboard_dir = Path(plugin["_dir"])
+    api_path = dashboard_dir / str(api_file_name)
+    resolved_api = api_path.resolve()
+    resolved_base = dashboard_dir.resolve()
+    resolved_api.relative_to(resolved_base)
+    source = resolved_api.read_bytes()
+    module_name = f"hermes_dashboard_plugin_{plugin_name}"
+    spec = importlib.util.spec_from_file_location(module_name, resolved_api)
+    if spec is None:
+        raise RuntimeError(f"cannot create module spec for {plugin_name}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
     try:
-        from hermes_cli.plugins_cmd import _get_enabled_set, _get_disabled_set
-        enabled_set = _get_enabled_set()
-        disabled_set = _get_disabled_set()
+        exec(compile(source, str(resolved_api), "exec"), mod.__dict__)
     except Exception:
-        enabled_set = set()
-        disabled_set = set()
+        sys.modules.pop(module_name, None)
+        raise
+    router = getattr(mod, "router", None)
+    if router is None:
+        sys.modules.pop(module_name, None)
+        raise RuntimeError(f"plugin {plugin_name} api file has no router")
+    return module_name, router
 
+
+def _replace_plugin_api_routes(plugin_name: str, module_name: str, router: Any) -> None:
+    """Atomically replace one plugin's route objects before the SPA catch-all."""
+    with _PLUGIN_API_ROUTE_LOCK:
+        before_ids = {id(route) for route in app.router.routes}
+        app.include_router(router, prefix=f"/api/plugins/{plugin_name}")
+        added = [route for route in app.router.routes if id(route) not in before_ids]
+        added_ids = {id(route) for route in added}
+        old_ids = {id(route) for route in _PLUGIN_API_ROUTES.get(plugin_name, [])}
+        retained = [
+            route
+            for route in app.router.routes
+            if id(route) not in added_ids and id(route) not in old_ids
+        ]
+        insert_at = next(
+            (
+                index
+                for index, route in enumerate(retained)
+                if getattr(route, "path", None) == "/{full_path:path}"
+            ),
+            len(retained),
+        )
+        retained[insert_at:insert_at] = added
+        app.router.routes[:] = retained
+        old_module = _PLUGIN_API_MODULES.get(plugin_name)
+        if old_module and old_module != module_name:
+            sys.modules.pop(old_module, None)
+        _PLUGIN_API_ROUTES[plugin_name] = added
+        _PLUGIN_API_MODULES[plugin_name] = module_name
+        app.openapi_schema = None
+
+
+def _refresh_plugin_api_routes(
+    plugin_name: str, *, plugin: Optional[dict[str, Any]] = None
+) -> None:
+    """Apply current install/enable/update state to one plugin API."""
+    if plugin is None:
+        plugin = next(
+            (
+                item
+                for item in _get_dashboard_plugins(force_rescan=True)
+                if item.get("name") == plugin_name
+            ),
+            None,
+        )
+    if not plugin or not plugin.get("_api_file"):
+        _unmount_plugin_api_routes(plugin_name)
+        return
+    from hermes_cli.plugins_cmd import _get_disabled_set, _get_enabled_set
+
+    if not _plugin_api_is_enabled(
+        plugin, _get_enabled_set(), _get_disabled_set()
+    ):
+        _unmount_plugin_api_routes(plugin_name)
+        return
+    module_name, router = _load_plugin_api_router(plugin)
+    _replace_plugin_api_routes(plugin_name, module_name, router)
+    _log.info("Mounted plugin API routes: /api/plugins/%s/", plugin_name)
+
+
+def _mount_plugin_api_routes() -> None:
+    """Mount enabled trusted plugin APIs at startup."""
     for plugin in _get_dashboard_plugins():
-        api_file_name = plugin.get("_api_file")
-        if not api_file_name:
-            continue
-        plugin_name = plugin.get("name", "")
-        # Gate: user plugins must be in plugins.enabled and not in
-        # plugins.disabled before we import their Python code.
-        # Bundled plugins are trusted (they ship with the release) but
-        # still respect an explicit disable.
-        if plugin.get("source") == "user":
-            if plugin_name in disabled_set:
-                _log.debug(
-                    "Plugin %s: skipping API mount (explicitly disabled)",
-                    plugin_name,
-                )
-                continue
-            if plugin_name not in enabled_set:
-                _log.debug(
-                    "Plugin %s: skipping API mount (not in plugins.enabled)",
-                    plugin_name,
-                )
-                continue
-        elif plugin.get("source") == "bundled":
-            if plugin_name in disabled_set:
-                _log.debug(
-                    "Plugin %s: skipping API mount (explicitly disabled)",
-                    plugin_name,
-                )
-                continue
-        if plugin.get("source") == "project":
-            _log.warning(
-                "Plugin %s: ignoring backend api=%s (project plugins may "
-                "not auto-import Python code; move the plugin to "
-                "~/.hermes/plugins/ if you trust it)",
-                plugin["name"], api_file_name,
-            )
-            continue
-        dashboard_dir = Path(plugin["_dir"])
-        api_path = dashboard_dir / api_file_name
-        try:
-            resolved_api = api_path.resolve()
-            resolved_base = dashboard_dir.resolve()
-            resolved_api.relative_to(resolved_base)
-        except (OSError, RuntimeError, ValueError):
-            # Discovery already filters this, but re-check here in case
-            # ``_dir`` was tampered with after caching or a future caller
-            # bypasses the validator.  Defence in depth keeps the import
-            # primitive contained even if the upstream check regresses.
-            _log.warning(
-                "Plugin %s: refusing to import api file outside its "
-                "dashboard directory (%s)", plugin["name"], api_path,
-            )
-            continue
-        if not api_path.exists():
-            _log.warning("Plugin %s declares api=%s but file not found", plugin["name"], api_file_name)
+        plugin_name = str(plugin.get("name") or "")
+        if not plugin_name or not plugin.get("_api_file"):
             continue
         try:
-            module_name = f"hermes_dashboard_plugin_{plugin['name']}"
-            spec = importlib.util.spec_from_file_location(module_name, api_path)
-            if spec is None or spec.loader is None:
-                continue
-            mod = importlib.util.module_from_spec(spec)
-            # Register in sys.modules BEFORE exec_module so pydantic/FastAPI
-            # can resolve forward references (e.g. models defined in a file
-            # that uses `from __future__ import annotations`). Without this,
-            # TypeAdapter lazy-build fails at first request with
-            # "is not fully defined" because the module namespace isn't
-            # reachable by name for string-annotation resolution.
-            sys.modules[module_name] = mod
-            try:
-                spec.loader.exec_module(mod)
-            except Exception:
-                sys.modules.pop(module_name, None)
-                raise
-            router = getattr(mod, "router", None)
-            if router is None:
-                _log.warning("Plugin %s api file has no 'router' attribute", plugin["name"])
-                continue
-            app.include_router(router, prefix=f"/api/plugins/{plugin['name']}")
-            _log.info("Mounted plugin API routes: /api/plugins/%s/", plugin["name"])
+            _refresh_plugin_api_routes(plugin_name, plugin=plugin)
         except Exception as exc:
-            _log.warning("Failed to load plugin %s API routes: %s", plugin["name"], exc)
+            _log.warning("Failed to load plugin %s API routes: %s", plugin_name, exc)
 
 
 # Mount plugin API routes before the SPA catch-all.

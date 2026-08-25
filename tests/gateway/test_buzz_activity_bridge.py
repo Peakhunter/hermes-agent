@@ -18,6 +18,11 @@ BuzzAdapter = _buzz_mod.BuzzAdapter
 _nostr_auth = _buzz_mod._load_nostr_auth()
 
 
+@pytest.fixture(autouse=True)
+def _clean_transport_override(monkeypatch):
+    monkeypatch.delenv("BUZZ_TRANSPORT", raising=False)
+
+
 class _CaptureRoute:
     def __init__(self, events):
         self.events = events

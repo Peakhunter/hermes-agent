@@ -3,6 +3,8 @@
 import asyncio
 import hashlib
 import json
+import os
+import signal
 import stat
 from collections import OrderedDict
 from pathlib import Path
@@ -410,6 +412,87 @@ async def test_membership_subscription_and_reconciliation_cover_add_and_remove()
     assert any(frame[0] == "REQ" and frame[2]["#h"] == ["joined"] for frame in websocket.frames)
 
 
+@pytest.mark.asyncio
+async def test_future_membership_timestamp_cannot_poison_reconnect_cursor(monkeypatch):
+    adapter = _make_adapter()
+    adapter._membership_since = 100
+    monkeypatch.setattr(_buzz_mod.time, "time", lambda: 1_000)
+    adapter._discover_joined_channels = AsyncMock(return_value=True)
+    adapter._discover_dms = AsyncMock(return_value=None)
+
+    class WebSocket:
+        async def send(self, _frame):
+            return None
+
+    await adapter._handle_membership_event(
+        WebSocket(),
+        {},
+        {"created_at": 9_999_999, "kind": 44100, "tags": []},
+    )
+
+    assert adapter._membership_since == 1_000
+    adapter._discover_joined_channels.assert_awaited_once_with(
+        since=1_000,
+        target_channel_id="",
+    )
+
+
+@pytest.mark.asyncio
+async def test_exec_buzz_cancellation_kills_and_reaps_child(tmp_path):
+    pid_path = tmp_path / "child.pid"
+    script = (
+        "import os,pathlib,time; "
+        f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
+        "time.sleep(60)"
+    )
+    task = asyncio.create_task(
+        _buzz_mod._exec_buzz(
+            os.environ.get("PYTHON", os.sys.executable),
+            ["-c", script],
+            relay_url="https://relay.invalid",
+            private_key="test-key",
+            timeout=60,
+        )
+    )
+    for _ in range(100):
+        if pid_path.exists():
+            break
+        await asyncio.sleep(0.01)
+    pid = int(pid_path.read_text())
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    try:
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_exec_buzz_media_stops_before_writing_beyond_cap(tmp_path):
+    output_path = tmp_path / "media.bin"
+    script = "import sys,time; sys.stdout.buffer.write(b'x' * 65536); sys.stdout.flush(); time.sleep(60)"
+
+    with pytest.raises(ValueError, match="too large"):
+        await _buzz_mod._exec_buzz_media(
+            os.environ.get("PYTHON", os.sys.executable),
+            ["-c", script],
+            relay_url="https://relay.invalid",
+            private_key="test-key",
+            output_path=output_path,
+            max_bytes=1024,
+            timeout=5,
+        )
+
+    assert not output_path.exists() or output_path.stat().st_size <= 1024
+
+
 # ── Adapter init / config precedence ──────────────────────────────────────
 
 
@@ -469,6 +552,21 @@ class TestCliErrorContract:
         self, stderr, returncode, expected
     ):
         assert _buzz_mod._cli_failure_is_retryable(stderr, returncode) is expected
+
+    def test_adapter_timeout_envelope_is_retryable(self):
+        stderr = json.dumps({"error": "timeout", "message": "buzz send timed out"})
+        assert _buzz_mod._cli_failure_is_retryable(stderr, 124) is True
+
+
+def test_marked_reply_beats_unmarked_legacy_tag_when_root_is_absent():
+    event = {
+        "tags": [
+            ["e", "unmarked-mention"],
+            ["e", "direct-parent", "", "reply"],
+        ]
+    }
+
+    assert _buzz_mod.buzz_event_thread_root(event) == "direct-parent"
 
 
 @pytest.mark.asyncio
@@ -928,6 +1026,7 @@ async def test_protected_relay_image_is_authenticated_cached_and_dispatched(
 
     adapter._run_cli = run_cli
     adapter._user_names[OTHER_PUBKEY] = "Alice"
+    adapter.set_authorization_check(lambda *_args: True)
     adapter.set_message_handler(capture)
     adapter.handle_message = capture
     state = {"chat_type": "group", "last_ts": 0, "seen": OrderedDict()}
@@ -961,21 +1060,67 @@ async def test_protected_relay_image_is_authenticated_cached_and_dispatched(
     assert not Path(calls[0][-1]).exists()
 
 
-def test_media_sender_authorization_tracks_live_policy(monkeypatch):
+def test_media_sender_authorization_uses_full_gateway_predicate():
     adapter = _make_adapter()
-    policy = {
-        "allowed_users": [OTHER_PUBKEY],
-        "allow_all_users": False,
-        "require_mention": True,
-        "thread_require_mention": True,
-    }
-    monkeypatch.setattr(_buzz_mod, "_effective_runtime_policy", lambda: policy)
+    decisions = []
 
-    assert adapter._media_sender_authorized(OTHER_PUBKEY) is True
-    policy["allowed_users"] = []
-    assert adapter._media_sender_authorized(OTHER_PUBKEY) is False
-    policy["allow_all_users"] = True
-    assert adapter._media_sender_authorized("f" * 64) is True
+    def authorize(user_id, chat_type, chat_id):
+        decisions.append((user_id, chat_type, chat_id))
+        return user_id == OTHER_PUBKEY
+
+    adapter.set_authorization_check(authorize)
+
+    assert adapter._media_sender_authorized(OTHER_PUBKEY, "group", CHANNEL) is True
+    assert adapter._media_sender_authorized("f" * 64, "group", CHANNEL) is False
+    assert decisions == [
+        (OTHER_PUBKEY, "group", CHANNEL),
+        ("f" * 64, "group", CHANNEL),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_dispatch_does_not_emit_seen_reaction():
+    adapter = _make_adapter()
+    adapter.set_authorization_check(lambda *_args: False)
+    adapter.set_message_handler(AsyncMock())
+    adapter.handle_message = AsyncMock()
+    adapter.send_reaction = AsyncMock()
+
+    await adapter._dispatch_message(
+        text="hello",
+        chat_id=CHANNEL,
+        chat_type="group",
+        user_id=OTHER_PUBKEY,
+        user_name="Alice",
+        message_id="unauthorized-event",
+        created_at=1,
+    )
+
+    adapter.handle_message.assert_awaited_once()
+    adapter.send_reaction.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_authorized_dispatch_emits_seen_reaction():
+    adapter = _make_adapter()
+    adapter.set_authorization_check(lambda *_args: True)
+    adapter.set_message_handler(AsyncMock())
+    adapter.handle_message = AsyncMock()
+    adapter.send_reaction = AsyncMock()
+
+    await adapter._dispatch_message(
+        text="hello",
+        chat_id=CHANNEL,
+        chat_type="group",
+        user_id=OTHER_PUBKEY,
+        user_name="Alice",
+        message_id="authorized-event",
+        created_at=1,
+    )
+
+    adapter.send_reaction.assert_awaited_once_with(
+        CHANNEL, "authorized-event", "👀"
+    )
 
 
 @pytest.mark.asyncio

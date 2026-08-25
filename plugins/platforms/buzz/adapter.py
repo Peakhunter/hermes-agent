@@ -650,8 +650,6 @@ def _is_valid_authoritative_channel_row(channel: object) -> bool:
         isinstance(channel, dict)
         and isinstance(channel.get("channel_id"), str)
         and channel["channel_id"].strip()
-        and isinstance(channel.get("type"), str)
-        and channel["type"].strip()
     )
 
 

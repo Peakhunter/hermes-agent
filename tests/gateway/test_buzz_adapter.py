@@ -207,7 +207,7 @@ async def test_joined_channel_discovery_removes_departed_group():
     "malformed_roster",
     [
         [{"type": "community", "name": "Missing id"}],
-        [{"channel_id": "new-channel", "name": "Missing type"}],
+        [{"channel_id": "   ", "name": "Blank id"}],
         [{"channel_id": "new-channel", "type": "community"}, "not-an-object"],
     ],
 )
@@ -2399,6 +2399,37 @@ class TestBuzzAdapterLifecycle:
 
         assert await adapter.connect() is True
         assert set(adapter._channel_state) == {dm_id}
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_connect_accepts_stock_buzz_0_5_18_channel_rows_without_type(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(_buzz_mod, "_resolve_private_key", lambda extra=None: "nsec1test")
+        adapter = _make_adapter(extra={"transport": "poll"})
+        adapter.cli_path = "/fake/buzz"
+        cli = _ScriptedCli()
+        cli.script("users", "get", [{"pubkey": SELF_PUBKEY, "display_name": "Chip"}])
+        cli.script(
+            "channels",
+            "list",
+            [
+                {
+                    "channel_id": CHANNEL,
+                    "created_at": 1_756_589_707,
+                    "description": "Development channel",
+                    "name": "Development",
+                }
+            ],
+        )
+        cli.script("messages", "get", [])
+        cli.script("dms", "list", [])
+        cli.script("channels", "list", [])
+        adapter._run_cli = cli
+
+        assert await adapter.connect() is True
+        assert adapter._channel_names == {CHANNEL: "Development"}
+        assert adapter._channel_state[CHANNEL]["chat_type"] == "group"
         await adapter.disconnect()
 
     @pytest.mark.asyncio

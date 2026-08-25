@@ -169,7 +169,9 @@ def test_plugin_install_endpoint_invalidates_hub_cache(monkeypatch):
     # hook must drop the memoized payload so the next fetch rebuilds.
     monkeypatch.setattr(web_server, "_require_token", lambda _request: None)
     monkeypatch.setattr(
-        plugins_cmd, "dashboard_install_plugin", lambda *a, **k: {"ok": True}
+        plugins_cmd,
+        "dashboard_install_plugin",
+        lambda *a, **k: {"ok": True, "plugin_name": "demo", "enabled": True},
     )
 
     asyncio.run(

@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import sys
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -125,6 +126,51 @@ def test_enabled_plugin_api_update_replaces_stale_routes(monkeypatch, tmp_path):
         ).json() == {"version": "v2"}
     finally:
         web_server._unmount_plugin_api_routes(plugin["name"])
+
+
+def test_enabled_plugin_api_update_reloads_imported_helper(monkeypatch, tmp_path):
+    from hermes_cli import plugins_cmd, web_server
+
+    dashboard = tmp_path / "dashboard"
+    dashboard.mkdir()
+    helper_name = "route_refresh_test_helper"
+    api_file = dashboard / "plugin_api.py"
+    helper_file = dashboard / f"{helper_name}.py"
+    plugin = {
+        "name": "route-refresh-helper-test",
+        "source": "user",
+        "_dir": str(dashboard),
+        "_api_file": "plugin_api.py",
+    }
+    monkeypatch.syspath_prepend(str(dashboard))
+    monkeypatch.setattr(web_server, "_get_dashboard_plugins", lambda **_kwargs: [plugin])
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {plugin["name"]})
+    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
+    api_file.write_text(
+        "from fastapi import APIRouter\n"
+        f"import {helper_name} as helper\n"
+        "router = APIRouter()\n"
+        "@router.get('/version')\n"
+        "def version(): return {'version': helper.VERSION}\n",
+        encoding="utf-8",
+    )
+    client = TestClient(web_server.app)
+    headers = {"X-Hermes-Session-Token": web_server._SESSION_TOKEN}
+    try:
+        helper_file.write_text("VERSION = 'v1'\n", encoding="utf-8")
+        web_server._refresh_plugin_api_routes(plugin["name"])
+        assert client.get(
+            f"/api/plugins/{plugin['name']}/version", headers=headers
+        ).json() == {"version": "v1"}
+
+        helper_file.write_text("VERSION = 'v2'\n", encoding="utf-8")
+        web_server._refresh_plugin_api_routes(plugin["name"])
+        assert client.get(
+            f"/api/plugins/{plugin['name']}/version", headers=headers
+        ).json() == {"version": "v2"}
+    finally:
+        web_server._unmount_plugin_api_routes(plugin["name"])
+        sys.modules.pop(helper_name, None)
 
 
 def test_plugin_install_strictly_mounts_its_api_before_reporting_success(monkeypatch):
@@ -257,6 +303,88 @@ def test_plugin_disable_unmounts_without_rediscovery(monkeypatch):
 
     assert response.status_code == 200
     unmount.assert_called_once_with(plugin_name)
+
+
+def test_plugin_remove_unmounts_before_failed_rediscovery(monkeypatch):
+    from hermes_cli import plugins_cmd, web_server
+
+    plugin_name = "removed-with-broken-discovery"
+    monkeypatch.setattr(
+        plugins_cmd,
+        "dashboard_remove_user_plugin",
+        MagicMock(return_value={"ok": True, "name": plugin_name}),
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_get_dashboard_plugins",
+        MagicMock(side_effect=OSError(24, "Too many open files")),
+    )
+    unmount = MagicMock()
+    monkeypatch.setattr(web_server, "_unmount_plugin_api_routes", unmount)
+
+    response = TestClient(web_server.app).delete(
+        f"/api/dashboard/agent-plugins/{plugin_name}",
+        headers={"X-Hermes-Session-Token": web_server._SESSION_TOKEN},
+    )
+
+    assert response.status_code == 200
+    unmount.assert_called_once_with(plugin_name)
+
+
+@pytest.mark.parametrize("operation", ["install", "update"])
+def test_plugin_mutation_fails_closed_when_rediscovery_fails(monkeypatch, operation):
+    from hermes_cli import plugins_cmd, web_server
+
+    plugin_name = f"{operation}-with-broken-discovery"
+    if operation == "install":
+        monkeypatch.setattr(
+            plugins_cmd,
+            "dashboard_install_plugin",
+            MagicMock(
+                return_value={
+                    "ok": True,
+                    "plugin_name": plugin_name,
+                    "enabled": True,
+                }
+            ),
+        )
+
+        def request(client, headers):
+            return client.post(
+                "/api/dashboard/agent-plugins/install",
+                headers=headers,
+                json={
+                    "identifier": "https://example.invalid/plugin.git",
+                    "enable": True,
+                },
+            )
+    else:
+        monkeypatch.setattr(
+            plugins_cmd,
+            "dashboard_update_user_plugin",
+            MagicMock(return_value={"ok": True, "name": plugin_name}),
+        )
+
+        def request(client, headers):
+            return client.post(
+                f"/api/dashboard/agent-plugins/{plugin_name}/update",
+                headers=headers,
+            )
+    monkeypatch.setattr(
+        web_server,
+        "_get_dashboard_plugins",
+        MagicMock(side_effect=OSError(24, "Too many open files")),
+    )
+    disable = MagicMock(return_value={"ok": True})
+    monkeypatch.setattr(plugins_cmd, "dashboard_set_agent_plugin_enabled", disable)
+
+    response = request(
+        TestClient(web_server.app),
+        {"X-Hermes-Session-Token": web_server._SESSION_TOKEN},
+    )
+
+    assert response.status_code == 500
+    disable.assert_called_once_with(plugin_name, enabled=False)
 
 
 def _run_dashboard_node(expression: str) -> dict[str, Any]:

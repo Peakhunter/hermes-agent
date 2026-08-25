@@ -18799,7 +18799,6 @@ async def post_agent_plugin_install(request: Request, body: _AgentPluginInstallB
             status_code=400,
             detail=result.get("error") or "Install failed.",
         )
-    _get_dashboard_plugins(force_rescan=True)
     plugin_name = str(result.get("plugin_name") or "").strip()
     if not plugin_name:
         raise HTTPException(
@@ -18892,7 +18891,6 @@ async def post_agent_plugin_update(request: Request, name: str):
     result = dashboard_update_user_plugin(name)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Update failed.")
-    _get_dashboard_plugins(force_rescan=True)
     _refresh_plugin_api_or_disable(name, operation="update")
     _invalidate_plugins_hub_cache()
     return result
@@ -18907,8 +18905,11 @@ async def delete_agent_plugin(request: Request, name: str):
     result = dashboard_remove_user_plugin(name)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Remove failed.")
-    _get_dashboard_plugins(force_rescan=True)
     _unmount_plugin_api_routes(name)
+    try:
+        _get_dashboard_plugins(force_rescan=True)
+    except Exception:
+        _log.warning("Plugin cache rescan failed after removing %s", name, exc_info=True)
     _invalidate_plugins_hub_cache()
     return result
 
@@ -19054,7 +19055,7 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
 
 _PLUGIN_API_ROUTE_LOCK = threading.RLock()
 _PLUGIN_API_ROUTES: dict[str, list[Any]] = {}
-_PLUGIN_API_MODULES: dict[str, str] = {}
+_PLUGIN_API_MODULES: dict[str, set[str]] = {}
 
 
 def _unmount_plugin_api_routes(plugin_name: str) -> None:
@@ -19066,8 +19067,8 @@ def _unmount_plugin_api_routes(plugin_name: str) -> None:
             app.router.routes[:] = [
                 route for route in app.router.routes if id(route) not in old_ids
             ]
-        module_name = _PLUGIN_API_MODULES.pop(plugin_name, None)
-        if module_name:
+        module_names = _PLUGIN_API_MODULES.pop(plugin_name, set())
+        for module_name in module_names:
             sys.modules.pop(module_name, None)
         app.openapi_schema = None
 
@@ -19097,6 +19098,18 @@ def _load_plugin_api_router(plugin: dict[str, Any]):
     resolved_api.relative_to(resolved_base)
     source = resolved_api.read_bytes()
     module_name = f"hermes_dashboard_plugin_{plugin_name}"
+    for old_module in _PLUGIN_API_MODULES.get(plugin_name, set()):
+        loaded = sys.modules.pop(old_module, None)
+        cached_file = getattr(loaded, "__cached__", None)
+        if cached_file:
+            try:
+                cached_path = Path(cached_file).resolve()
+                cached_path.relative_to(resolved_base)
+                cached_path.unlink(missing_ok=True)
+            except (OSError, ValueError):
+                pass
+    importlib.invalidate_caches()
+    modules_before = set(sys.modules)
     spec = importlib.util.spec_from_file_location(module_name, resolved_api)
     if spec is None:
         raise RuntimeError(f"cannot create module spec for {plugin_name}")
@@ -19111,10 +19124,23 @@ def _load_plugin_api_router(plugin: dict[str, Any]):
     if router is None:
         sys.modules.pop(module_name, None)
         raise RuntimeError(f"plugin {plugin_name} api file has no router")
-    return module_name, router
+    owned_modules = {module_name}
+    for loaded_name in set(sys.modules) - modules_before:
+        loaded = sys.modules.get(loaded_name)
+        loaded_file = getattr(loaded, "__file__", None)
+        if not loaded_file:
+            continue
+        try:
+            Path(loaded_file).resolve().relative_to(resolved_base)
+        except (OSError, ValueError):
+            continue
+        owned_modules.add(loaded_name)
+    return module_name, owned_modules, router
 
 
-def _replace_plugin_api_routes(plugin_name: str, module_name: str, router: Any) -> None:
+def _replace_plugin_api_routes(
+    plugin_name: str, module_names: set[str], router: Any
+) -> None:
     """Atomically replace one plugin's route objects before the SPA catch-all."""
     with _PLUGIN_API_ROUTE_LOCK:
         before_ids = {id(route) for route in app.router.routes}
@@ -19137,11 +19163,8 @@ def _replace_plugin_api_routes(plugin_name: str, module_name: str, router: Any) 
         )
         retained[insert_at:insert_at] = added
         app.router.routes[:] = retained
-        old_module = _PLUGIN_API_MODULES.get(plugin_name)
-        if old_module and old_module != module_name:
-            sys.modules.pop(old_module, None)
         _PLUGIN_API_ROUTES[plugin_name] = added
-        _PLUGIN_API_MODULES[plugin_name] = module_name
+        _PLUGIN_API_MODULES[plugin_name] = module_names
         app.openapi_schema = None
 
 
@@ -19168,8 +19191,8 @@ def _refresh_plugin_api_routes(
     ):
         _unmount_plugin_api_routes(plugin_name)
         return
-    module_name, router = _load_plugin_api_router(plugin)
-    _replace_plugin_api_routes(plugin_name, module_name, router)
+    _module_name, module_names, router = _load_plugin_api_router(plugin)
+    _replace_plugin_api_routes(plugin_name, module_names, router)
     _log.info("Mounted plugin API routes: /api/plugins/%s/", plugin_name)
 
 

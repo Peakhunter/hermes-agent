@@ -1101,6 +1101,40 @@ async def test_unauthorized_dispatch_does_not_emit_seen_reaction():
 
 
 @pytest.mark.asyncio
+async def test_unauthorized_dispatch_does_not_resolve_user_profile(monkeypatch):
+    adapter = _make_adapter(extra={"require_mention": False})
+    monkeypatch.setattr(
+        _buzz_mod,
+        "_effective_runtime_policy",
+        lambda: {
+            "allowed_users": [],
+            "allow_all_users": False,
+            "require_mention": False,
+            "thread_require_mention": False,
+        },
+    )
+    adapter.set_authorization_check(lambda *_args: False)
+    adapter.set_message_handler(AsyncMock())
+    adapter.handle_message = AsyncMock()
+    adapter._resolve_user_name = AsyncMock(return_value="Alice")
+
+    await adapter._handle_event(
+        CHANNEL,
+        {"chat_type": "group", "last_ts": 0, "seen": OrderedDict()},
+        {
+            "id": "unauthorized-event",
+            "kind": 9,
+            "pubkey": OTHER_PUBKEY,
+            "content": "hello",
+            "created_at": 1,
+            "tags": [],
+        },
+    )
+
+    adapter._resolve_user_name.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_authorized_dispatch_emits_seen_reaction():
     adapter = _make_adapter()
     adapter.set_authorization_check(lambda *_args: True)

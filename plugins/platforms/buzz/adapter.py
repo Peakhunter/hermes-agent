@@ -773,7 +773,7 @@ class BuzzAdapter(BasePlatformAdapter):
         # channel_id -> raw ``channels list`` entry; drives DM-vs-channel
         # classification (see _may_reclassify_as_dm).
         self._channel_meta: Dict[str, dict] = {}
-        self._user_names: Dict[str, str] = {}
+        self._user_names: OrderedDict[str, str] = OrderedDict()
         self._poll_count = 0
 
     @property
@@ -2041,7 +2041,7 @@ class BuzzAdapter(BasePlatformAdapter):
             chat_id=channel_id,
             chat_type="dm" if is_dm else "group",
             user_id=pubkey,
-            user_name=await self._resolve_user_name(pubkey),
+            user_name=None,
             message_id=event_id,
             created_at=created_at,
             thread_id=buzz_event_thread_root(event),
@@ -2177,6 +2177,7 @@ class BuzzAdapter(BasePlatformAdapter):
         """
         cached = self._user_names.get(pubkey)
         if cached is not None:
+            self._user_names.move_to_end(pubkey)
             return cached
         name = ""
         code, out, _err = await self._run_cli(["users", "get", "--pubkey", pubkey])
@@ -2187,6 +2188,8 @@ class BuzzAdapter(BasePlatformAdapter):
         if not name:
             name = (hex_to_npub(pubkey) or pubkey)[:16]
         self._user_names[pubkey] = name
+        while len(self._user_names) > _SEEN_CAP:
+            self._user_names.popitem(last=False)
         return name
 
     @staticmethod
@@ -2380,7 +2383,7 @@ class BuzzAdapter(BasePlatformAdapter):
         chat_id: str,
         chat_type: str,
         user_id: str,
-        user_name: str,
+        user_name: str | None,
         message_id: str,
         created_at: int,
         thread_id: str | None = None,
@@ -2394,7 +2397,7 @@ class BuzzAdapter(BasePlatformAdapter):
             chat_name=self._channel_names.get(chat_id, chat_id),
             chat_type=chat_type,
             user_id=user_id,
-            user_name=user_name,
+            user_name=user_name or user_id[:16],
             thread_id=thread_id or (message_id if chat_type != "dm" else None),
         )
         dispatch_text = text
@@ -2405,6 +2408,16 @@ class BuzzAdapter(BasePlatformAdapter):
             and self._media_sender_authorized(user_id, chat_type, chat_id)
         )
         if sender_authorized:
+            if user_name is None:
+                user_name = await self._resolve_user_name(user_id)
+                source = self.build_source(
+                    chat_id=chat_id,
+                    chat_name=self._channel_names.get(chat_id, chat_id),
+                    chat_type=chat_type,
+                    user_id=user_id,
+                    user_name=user_name,
+                    thread_id=thread_id or (message_id if chat_type != "dm" else None),
+                )
             dispatch_text, media_urls, media_types = await self._ingest_buzz_images(text)
 
         event = MessageEvent(

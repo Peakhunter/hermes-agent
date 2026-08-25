@@ -3325,6 +3325,28 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def read_user_config_raw_strict(config_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Read raw user config while rejecting a non-mapping YAML root.
+
+    This is the fail-closed companion to :func:`read_user_config_raw` for
+    security-sensitive policy inspection.  A missing file is still an empty
+    config, while malformed YAML, unreadable files, and non-mapping roots stay
+    distinguishable from a valid empty mapping.
+    """
+    if config_path is None:
+        config_path = get_config_path()
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            data = fast_safe_load(f)
+    except FileNotFoundError:
+        return {}
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError("config root must be a mapping")
+    return data
+
+
 def read_raw_config_readonly() -> Dict[str, Any]:
     """Fast-path variant of ``read_raw_config()`` for callers that ONLY READ.
 

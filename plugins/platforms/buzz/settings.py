@@ -9,8 +9,6 @@ import re
 import threading
 from typing import Any, Callable, cast
 
-import yaml
-
 
 _BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 _POLICY_FIELDS = (
@@ -234,25 +232,19 @@ class RuntimePolicyLoader:
 
     def load(self, profile: str | None = None) -> dict[str, Any]:
         from hermes_cli import managed_scope
-        from hermes_cli.config import _deep_merge, read_user_config_raw
+        from hermes_cli.config import _deep_merge, read_user_config_raw_strict
 
         config_path = _profile_home(profile) / "config.yaml"
         managed_dir = managed_scope.get_managed_dir()
         scope_key = self._scope_key(config_path, managed_dir)
         with self._lock:
             try:
-                config = read_user_config_raw(config_path)
+                config = read_user_config_raw_strict(config_path)
                 if managed_dir is not None:
                     managed_path = managed_dir / "config.yaml"
-                    try:
-                        managed_text = managed_path.read_text(encoding="utf-8")
-                    except FileNotFoundError:
-                        managed_text = ""
-                    if managed_text:
-                        parsed: Any = yaml.safe_load(managed_text) or {}
-                        if not isinstance(parsed, dict):
-                            raise ValueError("managed config root must be a mapping")
-                        config = _deep_merge(config, cast(dict[str, Any], parsed))
+                    parsed = read_user_config_raw_strict(managed_path)
+                    if parsed:
+                        config = _deep_merge(config, parsed)
             except Exception:
                 return deepcopy(self._last_valid.get(scope_key, _DEFAULT_POLICY))
             try:

@@ -4311,7 +4311,7 @@ class TurnRunner:
         self,
         runner: "GatewayRunner",
         ctx: TurnContext,
-        observer: GatewayTurnObserver,
+        observer: Optional[GatewayTurnObserver] = None,
     ) -> None:
         self._runner = runner
         self._ctx = ctx
@@ -22553,13 +22553,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter._send_multiple_images_with_routing(
-                        chat_id=event.source.chat_id,
-                        images=images,
-                        metadata=_thread_meta,
-                        human_delay=0.0,
-                        reply_to=_reply_anchor,
+                    routed_sender = getattr(
+                        adapter, "_send_multiple_images_with_routing", None
                     )
+                    if callable(routed_sender):
+                        await routed_sender(
+                            chat_id=event.source.chat_id,
+                            images=images,
+                            metadata=_thread_meta,
+                            human_delay=0.0,
+                            reply_to=_reply_anchor,
+                        )
+                    else:
+                        await adapter.send_multiple_images(
+                            chat_id=event.source.chat_id,
+                            images=images,
+                            metadata=_thread_meta,
+                        )
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
 

@@ -14,7 +14,6 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, StrictBool, field_validator, model_validator
-import yaml
 
 from plugins.platforms.buzz import settings
 
@@ -74,19 +73,9 @@ class BuzzPolicyUpdate(BaseModel):
 def _read_user_config_strict() -> dict[str, Any]:
     """Failure-preserving, unexpanded read of the selected user config."""
 
-    from hermes_cli.config import get_config_path
+    from hermes_cli.config import read_user_config_raw_strict
 
-    path = get_config_path()
-    try:
-        with path.open(encoding="utf-8") as stream:
-            parsed = yaml.safe_load(stream)
-    except FileNotFoundError:
-        return {}
-    if parsed is None:
-        return {}
-    if not isinstance(parsed, dict):
-        raise ValueError("user config root must be a mapping")
-    return parsed
+    return read_user_config_raw_strict()
 
 
 def _canonical_extra(config: dict[str, Any]) -> dict[str, Any]:
@@ -144,9 +133,9 @@ def _managed_policy_state() -> tuple[set[str], bool]:
     if not managed_path.exists():
         return set(), False
     try:
-        parsed = yaml.safe_load(managed_path.read_text(encoding="utf-8")) or {}
-        if not isinstance(parsed, dict):
-            raise ValueError("managed config root must be a mapping")
+        from hermes_cli.config import read_user_config_raw_strict
+
+        parsed = read_user_config_raw_strict(managed_path)
     except Exception:
         return set(), True
     return _policy_fields(parsed), False
@@ -225,7 +214,9 @@ def _managed_environment_reference_fields() -> set[str]:
     if not path.exists():
         return set()
     try:
-        parsed = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        from hermes_cli.config import read_user_config_raw_strict
+
+        parsed = read_user_config_raw_strict(path)
         return _environment_reference_fields(parsed)
     except Exception:
         return set(_POLICY_FIELDS)

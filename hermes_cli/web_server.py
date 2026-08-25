@@ -18831,6 +18831,30 @@ def _validate_plugin_name(name: str) -> str:
     return name
 
 
+def _refresh_plugin_api_or_disable(plugin_name: str, *, operation: str) -> None:
+    """Refresh one plugin API or roll a partial lifecycle change closed."""
+    from hermes_cli.plugins_cmd import dashboard_set_agent_plugin_enabled
+
+    try:
+        _refresh_plugin_api_routes(plugin_name)
+    except Exception as exc:
+        _unmount_plugin_api_routes(plugin_name)
+        dashboard_set_agent_plugin_enabled(plugin_name, enabled=False)
+        _log.warning(
+            "Plugin %s API activation failed after %s: %s",
+            plugin_name,
+            operation,
+            exc,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Plugin {operation} completed but its backend API could not be "
+                "activated; the plugin was disabled."
+            ),
+        ) from exc
+
+
 @app.post("/api/dashboard/agent-plugins/{name:path}/enable")
 async def post_agent_plugin_enable(request: Request, name: str):
     _require_token(request)
@@ -18840,7 +18864,7 @@ async def post_agent_plugin_enable(request: Request, name: str):
     result = dashboard_set_agent_plugin_enabled(name, enabled=True)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Enable failed.")
-    _refresh_plugin_api_routes(name)
+    _refresh_plugin_api_or_disable(name, operation="enable")
     _invalidate_plugins_hub_cache()
     return result
 
@@ -18854,7 +18878,7 @@ async def post_agent_plugin_disable(request: Request, name: str):
     result = dashboard_set_agent_plugin_enabled(name, enabled=False)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Disable failed.")
-    _refresh_plugin_api_routes(name)
+    _unmount_plugin_api_routes(name)
     _invalidate_plugins_hub_cache()
     return result
 
@@ -18869,7 +18893,7 @@ async def post_agent_plugin_update(request: Request, name: str):
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "Update failed.")
     _get_dashboard_plugins(force_rescan=True)
-    _refresh_plugin_api_routes(name)
+    _refresh_plugin_api_or_disable(name, operation="update")
     _invalidate_plugins_hub_cache()
     return result
 

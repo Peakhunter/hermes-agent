@@ -184,6 +184,81 @@ def test_plugin_install_disables_partial_enable_when_api_mount_fails(monkeypatch
     disable.assert_called_once_with("broken-live-api", enabled=False)
 
 
+@pytest.mark.parametrize("operation", ["enable", "update"])
+def test_plugin_lifecycle_disables_when_api_refresh_fails(monkeypatch, operation):
+    from hermes_cli import plugins_cmd, web_server
+
+    plugin_name = f"broken-{operation}-api"
+    if operation == "enable":
+        monkeypatch.setattr(
+            plugins_cmd,
+            "dashboard_set_agent_plugin_enabled",
+            MagicMock(return_value={"ok": True, "name": plugin_name}),
+        )
+    else:
+        monkeypatch.setattr(
+            plugins_cmd,
+            "dashboard_update_user_plugin",
+            MagicMock(return_value={"ok": True, "name": plugin_name}),
+        )
+        monkeypatch.setattr(web_server, "_get_dashboard_plugins", lambda **_kwargs: [])
+
+    monkeypatch.setattr(
+        web_server,
+        "_refresh_plugin_api_routes",
+        MagicMock(side_effect=RuntimeError("broken api")),
+    )
+    unmount = MagicMock()
+    monkeypatch.setattr(web_server, "_unmount_plugin_api_routes", unmount)
+    disable = MagicMock(return_value={"ok": True})
+    if operation == "enable":
+        original = plugins_cmd.dashboard_set_agent_plugin_enabled
+
+        def set_enabled(name, *, enabled):
+            if enabled:
+                return original(name, enabled=enabled)
+            return disable(name, enabled=enabled)
+
+        monkeypatch.setattr(plugins_cmd, "dashboard_set_agent_plugin_enabled", set_enabled)
+    else:
+        monkeypatch.setattr(plugins_cmd, "dashboard_set_agent_plugin_enabled", disable)
+
+    response = TestClient(web_server.app).post(
+        f"/api/dashboard/agent-plugins/{plugin_name}/{operation}",
+        headers={"X-Hermes-Session-Token": web_server._SESSION_TOKEN},
+    )
+
+    assert response.status_code == 500
+    unmount.assert_called_once_with(plugin_name)
+    disable.assert_called_once_with(plugin_name, enabled=False)
+
+
+def test_plugin_disable_unmounts_without_rediscovery(monkeypatch):
+    from hermes_cli import plugins_cmd, web_server
+
+    plugin_name = "disable-with-broken-discovery"
+    monkeypatch.setattr(
+        plugins_cmd,
+        "dashboard_set_agent_plugin_enabled",
+        MagicMock(return_value={"ok": True, "name": plugin_name}),
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_refresh_plugin_api_routes",
+        MagicMock(side_effect=RuntimeError("discovery unavailable")),
+    )
+    unmount = MagicMock()
+    monkeypatch.setattr(web_server, "_unmount_plugin_api_routes", unmount)
+
+    response = TestClient(web_server.app).post(
+        f"/api/dashboard/agent-plugins/{plugin_name}/disable",
+        headers={"X-Hermes-Session-Token": web_server._SESSION_TOKEN},
+    )
+
+    assert response.status_code == 200
+    unmount.assert_called_once_with(plugin_name)
+
+
 def _run_dashboard_node(expression: str) -> dict[str, Any]:
     script = (
         "const dashboard = require('./plugins/platforms/buzz/dashboard/src/index.js');\n"

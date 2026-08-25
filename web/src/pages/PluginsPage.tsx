@@ -1040,7 +1040,7 @@ function PluginRowCard(props: PluginRowCardProps) {
               </Button>
             ) : null}
 
-            {row.has_dashboard_manifest ? (
+            {row.has_dashboard_manifest && (!dm?.tab?.hidden || row.user_hidden) ? (
               <Button
                 disabled={busy}
                 ghost

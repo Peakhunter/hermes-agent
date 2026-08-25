@@ -18784,7 +18784,10 @@ async def get_plugins_hub(request: Request):
 @app.post("/api/dashboard/agent-plugins/install")
 async def post_agent_plugin_install(request: Request, body: _AgentPluginInstallBody):
     _require_token(request)
-    from hermes_cli.plugins_cmd import dashboard_install_plugin
+    from hermes_cli.plugins_cmd import (
+        dashboard_install_plugin,
+        dashboard_set_agent_plugin_enabled,
+    )
 
     result = dashboard_install_plugin(
         body.identifier.strip(),
@@ -18797,7 +18800,23 @@ async def post_agent_plugin_install(request: Request, body: _AgentPluginInstallB
             detail=result.get("error") or "Install failed.",
         )
     _get_dashboard_plugins(force_rescan=True)
-    _mount_plugin_api_routes()
+    plugin_name = str(result.get("plugin_name") or "").strip()
+    if not plugin_name:
+        raise HTTPException(
+            status_code=500,
+            detail="Plugin installation returned no plugin identity.",
+        )
+    try:
+        _refresh_plugin_api_routes(plugin_name)
+    except Exception as exc:
+        _unmount_plugin_api_routes(plugin_name)
+        if result.get("enabled"):
+            dashboard_set_agent_plugin_enabled(plugin_name, enabled=False)
+        _log.warning("Plugin %s API activation failed after install: %s", plugin_name, exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Plugin installed but its backend API could not be activated; the plugin was disabled.",
+        ) from exc
     _invalidate_plugins_hub_cache()
     # Strip internal paths from the response
     result.pop("after_install_path", None)

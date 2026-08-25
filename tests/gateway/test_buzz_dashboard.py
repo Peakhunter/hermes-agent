@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import subprocess
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi import HTTPException
@@ -124,6 +125,63 @@ def test_enabled_plugin_api_update_replaces_stale_routes(monkeypatch, tmp_path):
         ).json() == {"version": "v2"}
     finally:
         web_server._unmount_plugin_api_routes(plugin["name"])
+
+
+def test_plugin_install_strictly_mounts_its_api_before_reporting_success(monkeypatch):
+    from hermes_cli import plugins_cmd, web_server
+
+    monkeypatch.setattr(
+        plugins_cmd,
+        "dashboard_install_plugin",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "plugin_name": "installed-live-api",
+            "enabled": True,
+        },
+    )
+    monkeypatch.setattr(web_server, "_get_dashboard_plugins", lambda **_kwargs: [])
+    refresh = MagicMock()
+    monkeypatch.setattr(web_server, "_refresh_plugin_api_routes", refresh)
+
+    response = TestClient(web_server.app).post(
+        "/api/dashboard/agent-plugins/install",
+        headers={"X-Hermes-Session-Token": web_server._SESSION_TOKEN},
+        json={"identifier": "https://example.invalid/plugin.git", "enable": True},
+    )
+
+    assert response.status_code == 200
+    refresh.assert_called_once_with("installed-live-api")
+
+
+def test_plugin_install_disables_partial_enable_when_api_mount_fails(monkeypatch):
+    from hermes_cli import plugins_cmd, web_server
+
+    monkeypatch.setattr(
+        plugins_cmd,
+        "dashboard_install_plugin",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "plugin_name": "broken-live-api",
+            "enabled": True,
+        },
+    )
+    monkeypatch.setattr(web_server, "_get_dashboard_plugins", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        web_server,
+        "_refresh_plugin_api_routes",
+        MagicMock(side_effect=RuntimeError("broken api")),
+    )
+    disable = MagicMock(return_value={"ok": True})
+    monkeypatch.setattr(plugins_cmd, "dashboard_set_agent_plugin_enabled", disable)
+
+    response = TestClient(web_server.app).post(
+        "/api/dashboard/agent-plugins/install",
+        headers={"X-Hermes-Session-Token": web_server._SESSION_TOKEN},
+        json={"identifier": "https://example.invalid/plugin.git", "enable": True},
+    )
+
+    assert response.status_code == 500
+    disable.assert_called_once_with("broken-live-api", enabled=False)
 
 
 def _run_dashboard_node(expression: str) -> dict[str, Any]:

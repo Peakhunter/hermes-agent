@@ -18662,14 +18662,20 @@ def _merged_plugins_hub(force_refresh: bool = False) -> Dict[str, Any]:
         aliases = {name}
         if key:
             aliases.add(key)
+        dir_path = Path(dir_str)
+        manifest_data = _read_plugin_manifest_at(dir_path)
         if aliases & disabled_set:
             runtime_status = "disabled"
         elif aliases & enabled_set:
             runtime_status = "enabled"
+        elif source == "bundled" and manifest_data.get("kind") == "platform":
+            # Bundled platform adapters are available by default through the
+            # deferred platform registry; plugins.enabled is only required for
+            # standalone/user plugins. Reflect the actual runtime contract.
+            runtime_status = "enabled"
         else:
             runtime_status = "inactive"
 
-        dir_path = Path(dir_str)
         dm = dash_by_name.get(name)
         has_dash_manifest = dm is not None or (dir_path / "dashboard" / "manifest.json").exists()
 
@@ -18689,7 +18695,6 @@ def _merged_plugins_hub(force_refresh: bool = False) -> Dict[str, Any]:
         # live probe inside this request path.
         auth_required = False
         auth_command = ""
-        manifest_data = _read_plugin_manifest_at(dir_path)
         provides_tools = manifest_data.get("provides_tools") or []
         if provides_tools:
             try:

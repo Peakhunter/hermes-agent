@@ -83,6 +83,8 @@ export type BuildWsAuthParam = () => Promise<[string, string]>;
 export interface PluginSlotMetadata {
   /** Config-section icon; ignored by host slots that do not render metadata. */
   icon?: ComponentType<{ className?: string }>;
+  /** Number of user-configurable options rendered by a Config section. */
+  optionCount?: number;
 }
 
 export interface PluginRegistry {

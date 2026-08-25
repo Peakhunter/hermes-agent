@@ -442,7 +442,7 @@ def test_dashboard_bundle_uses_policy_api_profile_and_stale_response_guards():
     assert "useEffect" in source and "[profile]" in source
     assert '"config:section:buzz"' in source
     assert "BuzzPolicyPanel" in source
-    assert "{ icon: BuzzSectionIcon }" in source
+    assert "{ icon: BuzzSectionIcon, optionCount: 4 }" in source
     assert "registry.register(PLUGIN_NAME" not in source
 
 

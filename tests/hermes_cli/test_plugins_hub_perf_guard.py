@@ -140,6 +140,28 @@ def test_plugins_hub_short_ttl_cache_collapses_duplicate_fetches(monkeypatch):
     assert first is second
 
 
+def test_plugins_hub_reports_bundled_platform_as_enabled_by_default(monkeypatch):
+    """Bundled platforms are available lazily without plugins.enabled entries."""
+    tools_registry.invalidate_check_fn_cache()
+    web_server._invalidate_plugins_hub_cache()
+    row = [("buzz-platform", "1.0.0", "Buzz", "bundled", "/tmp/buzz", "platforms/buzz")]
+    _patch_minimal_hub_dependencies(
+        monkeypatch,
+        check_fn=lambda: True,
+        discover_all_plugins=lambda: row,
+    )
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: set())
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_read_manifest",
+        lambda _path: {"kind": "platform", "provides_tools": []},
+    )
+
+    payload = web_server._merged_plugins_hub(force_refresh=True)
+
+    assert payload["plugins"][0]["runtime_status"] == "enabled"
+
+
 def test_plugin_install_endpoint_invalidates_hub_cache(monkeypatch):
     import asyncio
 

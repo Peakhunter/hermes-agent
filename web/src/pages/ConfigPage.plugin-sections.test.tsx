@@ -60,6 +60,7 @@ describe("Config plugin sections", () => {
         icon: ({ className }) => (
           <span data-testid="buzz-section-icon" className={className} />
         ),
+        optionCount: 4,
       },
     );
     container = document.createElement("div");
@@ -92,6 +93,7 @@ describe("Config plugin sections", () => {
       (button) => button.textContent?.includes("Buzz"),
     );
     expect(buzzSection).toBeDefined();
+    expect(buzzSection?.textContent).toMatch(/Buzz\s*4/);
     expect(buzzSection?.querySelector('[data-testid="buzz-section-icon"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="buzz-policy-panel"]')).toBeNull();
 

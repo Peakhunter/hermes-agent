@@ -451,7 +451,7 @@
     PLUGIN_NAME,
     "config:section:buzz",
     BuzzPolicyPanel,
-    { icon: BuzzSectionIcon },
+    { icon: BuzzSectionIcon, optionCount: 4 },
   );
   return helpers;
 });

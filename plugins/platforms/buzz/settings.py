@@ -418,14 +418,6 @@ def with_environment_overrides(
         value = getenv(_ENV_KEYS[field])
         if value is not None:
             effective[field] = _configured_bool(value, field=_ENV_KEYS[field])
-    global_allow = getenv("GATEWAY_ALLOW_ALL_USERS")
-    if global_allow is not None and str(global_allow).strip().lower() in {
-        "true",
-        "1",
-        "yes",
-        "on",
-    }:
-        effective["allow_all_users"] = True
     return effective
 
 

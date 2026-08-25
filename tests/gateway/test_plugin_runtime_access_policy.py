@@ -243,6 +243,35 @@ def test_explicit_scoped_env_values_override_runtime_policy(monkeypatch):
         secret_scope.set_multiplex_active(False)
 
 
+def test_present_gate_prefers_installed_scope_outside_multiplex(monkeypatch):
+    from agent import secret_scope
+    from gateway.authz_mixin import _platform_gate_env_present
+
+    monkeypatch.setenv(ALLOWED_USERS_ENV, "process-user")
+    secret_scope.set_multiplex_active(False)
+    token = secret_scope.set_secret_scope({ALLOWED_USERS_ENV: "scoped-user"})
+    try:
+        assert _platform_gate_env_present(ALLOWED_USERS_ENV) == (
+            True,
+            "scoped-user",
+        )
+    finally:
+        secret_scope.reset_secret_scope(token)
+
+
+def test_present_gate_refuses_process_env_without_scope_during_multiplex(monkeypatch):
+    from agent import secret_scope
+    from gateway.authz_mixin import _platform_gate_env_present
+
+    monkeypatch.setenv(ALLOWED_USERS_ENV, "process-user")
+    monkeypatch.setattr(secret_scope, "current_secret_scope", lambda: None)
+    secret_scope.set_multiplex_active(True)
+    try:
+        assert _platform_gate_env_present(ALLOWED_USERS_ENV) == (False, "")
+    finally:
+        secret_scope.set_multiplex_active(False)
+
+
 @pytest.mark.parametrize(
     "failure",
     ["import", "scope", "multiplex", "membership", "value"],

@@ -108,6 +108,8 @@ interface SlotEntry {
 
 export interface SlotMetadata {
   icon?: React.ComponentType<{ className?: string }>;
+  /** Number of user-configurable options rendered by a Config section. */
+  optionCount?: number;
 }
 
 /** Map<slotName, SlotEntry[]>. Entries are appended in registration order. */
@@ -175,6 +177,25 @@ export function getConfigSectionIcons(): Record<
   return icons;
 }
 
+/** Declared option counts for plugin-owned Config sections. */
+export function getConfigSectionOptionCounts(): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const [slot, entries] of _slotRegistry.entries()) {
+    if (!slot.startsWith(CONFIG_SECTION_PREFIX)) continue;
+    const section = slot.slice(CONFIG_SECTION_PREFIX.length);
+    const declared = entries
+      .map((entry) => entry.metadata?.optionCount)
+      .filter(
+        (count): count is number =>
+          typeof count === "number" && Number.isInteger(count) && count >= 0,
+      );
+    if (section && declared.length > 0) {
+      counts[section] = declared.reduce((sum, count) => sum + count, 0);
+    }
+  }
+  return counts;
+}
+
 /** Reactively track plugin-owned Config sections as plugins load/unload. */
 export function useConfigSectionNames(): string[] {
   const [sections, setSections] = useState<string[]>(getConfigSectionNames);
@@ -198,6 +219,17 @@ export function useConfigSectionIcons(): Record<
     return onSlotRegistered(refresh);
   }, []);
   return icons;
+}
+
+/** Reactively track declared option counts for plugin-owned Config sections. */
+export function useConfigSectionOptionCounts(): Record<string, number> {
+  const [counts, setCounts] = useState(getConfigSectionOptionCounts);
+  useEffect(() => {
+    const refresh = () => setCounts(getConfigSectionOptionCounts());
+    refresh();
+    return onSlotRegistered(refresh);
+  }, []);
+  return counts;
 }
 
 /** Subscribe to registry changes. Returns an unsubscribe function. */

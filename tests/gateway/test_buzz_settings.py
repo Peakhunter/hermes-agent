@@ -726,6 +726,65 @@ def test_registration_drives_live_central_authorization_in_transport_profile(
         platform_registry.unregister("buzz", scope=scope)
 
 
+def test_global_allow_all_does_not_override_explicit_buzz_allowlist(
+    monkeypatch, tmp_path
+):
+    from gateway.authz_mixin import GatewayAuthorizationMixin
+    from gateway.config import Platform
+    from gateway.platform_registry import PlatformEntry, platform_registry
+    from gateway.session import SessionSource
+    from plugins.platforms.buzz import adapter as buzz_adapter
+
+    root = tmp_path / "hermes"
+    root.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+    monkeypatch.setenv("BUZZ_ALLOWED_USERS", "a" * 64)
+    monkeypatch.delenv("BUZZ_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "gateway.run",
+        SimpleNamespace(logger=logging.getLogger("gateway.run")),
+    )
+
+    class Runner(GatewayAuthorizationMixin):
+        def __init__(self):
+            self.adapters = {}
+            self._profile_adapters = {}
+            self.pairing_store = None
+            self.pairing_stores = {}
+            self.config = SimpleNamespace(platforms={})
+
+    captured = {}
+
+    class Context:
+        def register_platform(self, **kwargs):
+            captured.update(kwargs)
+
+    buzz_adapter.register(Context())
+    scope = platform_registry.current_scope_key()
+    platform_registry.unregister("buzz", scope=scope)
+    platform_registry.register(
+        PlatformEntry(source="plugin", **captured),
+        scope=scope,
+    )
+    try:
+        def source(user_id):
+            return SessionSource(
+                platform=Platform("buzz"),
+                user_id=user_id,
+                chat_id="shared-channel",
+                user_name=user_id,
+                chat_type="group",
+            )
+
+        runner = Runner()
+        assert runner._is_user_authorized(source("a" * 64)) is True
+        assert runner._is_user_authorized(source("b" * 64)) is False
+    finally:
+        platform_registry.unregister("buzz", scope=scope)
+
+
 def test_yaml_bridge_keeps_transport_but_never_snapshots_live_policy(monkeypatch):
     from plugins.platforms.buzz import adapter as buzz_adapter
 

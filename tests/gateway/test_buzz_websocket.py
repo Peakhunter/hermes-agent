@@ -39,6 +39,7 @@ CHANNEL = "ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd"
 def _clean_transport_override(monkeypatch):
     monkeypatch.delenv("BUZZ_TRANSPORT", raising=False)
     monkeypatch.delenv("BUZZ_AUTH_TAG", raising=False)
+    monkeypatch.delenv("BUZZ_CHANNELS", raising=False)
 
 
 def _make_adapter(extra=None):

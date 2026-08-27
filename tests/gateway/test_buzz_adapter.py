@@ -398,6 +398,7 @@ async def test_membership_subscription_and_reconciliation_cover_add_and_remove()
 
     adapter._discover_joined_channels = discover_joined_channels
     adapter._discover_dms = discover_dms
+    adapter._publish_directory_websocket = AsyncMock(return_value=True)
     websocket.frames.clear()
 
     await adapter._handle_membership_event(
@@ -419,6 +420,7 @@ async def test_future_membership_timestamp_cannot_poison_reconnect_cursor(monkey
     monkeypatch.setattr(_buzz_mod.time, "time", lambda: 1_000)
     adapter._discover_joined_channels = AsyncMock(return_value=True)
     adapter._discover_dms = AsyncMock(return_value=None)
+    adapter._publish_directory_websocket = AsyncMock(return_value=True)
 
     class WebSocket:
         async def send(self, _frame):
@@ -2523,6 +2525,63 @@ class TestBuzzAdapterLifecycle:
         assert adapter._channel_names == {CHANNEL: "Development"}
         assert adapter._channel_state[CHANNEL]["chat_type"] == "group"
         await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_poll_connect_attempts_directory_publication_before_marking_connected(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            _buzz_mod, "_resolve_private_key", lambda extra=None: "nsec1test"
+        )
+        adapter = _make_adapter(extra={"transport": "poll"})
+        adapter.cli_path = "/fake/buzz"
+        cli = _ScriptedCli()
+        cli.script(
+            "users",
+            "get",
+            [{"pubkey": SELF_PUBKEY, "display_name": "Chip"}],
+        )
+        cli.script(
+            "channels",
+            "list",
+            [{"channel_id": CHANNEL, "type": "community", "name": "General"}],
+        )
+        cli.script("messages", "get", [])
+        cli.script("dms", "list", [])
+        cli.script("channels", "list", [])
+        adapter._run_cli = cli
+        adapter._publish_directory_fallback = AsyncMock(return_value=False)
+
+        assert await adapter.connect() is True
+        adapter._publish_directory_fallback.assert_awaited_once_with(force=True)
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_poll_reconciliation_retries_failed_directory_publication(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter(extra={"transport": "poll"})
+        adapter.poll_interval = 0
+        monkeypatch.setattr(_buzz_mod, "_CHANNEL_DISCOVERY_EVERY", 1)
+        sleeps = 0
+
+        async def bounded_sleep(_delay):
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps > 2:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(_buzz_mod.asyncio, "sleep", bounded_sleep)
+        adapter._discover_joined_channels = AsyncMock(return_value=True)
+        adapter._discover_dms = AsyncMock()
+        adapter._publish_directory_fallback = AsyncMock(
+            side_effect=[False, True]
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await adapter._poll_loop()
+
+        assert adapter._publish_directory_fallback.await_count == 2
 
     @pytest.mark.asyncio
     async def test_successful_connect_keeps_identity_lock_until_disconnect(self, monkeypatch):

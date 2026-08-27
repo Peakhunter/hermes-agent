@@ -124,6 +124,12 @@ def _tagged_hash(tag: str, payload: bytes) -> bytes:
     return hashlib.sha256(tag_hash + tag_hash + payload).digest()
 
 
+def _strict_lower_hex(value: object, length: int) -> bool:
+    return isinstance(value, str) and len(value) == length and all(
+        char in "0123456789abcdef" for char in value
+    )
+
+
 def public_key_hex(private_key: str) -> str:
     point = _point_multiply(decode_private_key(private_key))
     if point is None:  # pragma: no cover - range validation makes this unreachable
@@ -346,6 +352,144 @@ def schnorr_sign(
     return nonce_x + signature_scalar.to_bytes(32, "big")
 
 
+def schnorr_verify(message: bytes, public_key_hex: str, signature_hex: str) -> bool:
+    """Verify a strict lowercase-hex BIP-340 signature."""
+    if (
+        len(message) != 32
+        or not _strict_lower_hex(public_key_hex, 64)
+        or not _strict_lower_hex(signature_hex, 128)
+    ):
+        return False
+    public_x = int(public_key_hex, 16)
+    if public_x >= FIELD_ORDER:
+        return False
+    y_squared = (pow(public_x, 3, FIELD_ORDER) + 7) % FIELD_ORDER
+    public_y = pow(y_squared, (FIELD_ORDER + 1) // 4, FIELD_ORDER)
+    if pow(public_y, 2, FIELD_ORDER) != y_squared:
+        return False
+    if public_y & 1:
+        public_y = FIELD_ORDER - public_y
+    signature = bytes.fromhex(signature_hex)
+    nonce_x = int.from_bytes(signature[:32], "big")
+    scalar = int.from_bytes(signature[32:], "big")
+    if nonce_x >= FIELD_ORDER or scalar >= CURVE_ORDER:
+        return False
+    challenge = (
+        int.from_bytes(
+            _tagged_hash(
+                "BIP0340/challenge",
+                signature[:32] + bytes.fromhex(public_key_hex) + message,
+            ),
+            "big",
+        )
+        % CURVE_ORDER
+    )
+    point = _point_add(
+        _point_multiply(scalar),
+        _point_multiply(CURVE_ORDER - challenge, (public_x, public_y)),
+    )
+    return point is not None and point[1] % 2 == 0 and point[0] == nonce_x
+
+
+def build_signed_event(
+    *,
+    private_key: str,
+    kind: int,
+    tags: list[list[str]],
+    content: str,
+    created_at: Optional[int] = None,
+    auxiliary_randomness: Optional[bytes] = None,
+) -> dict[str, Any]:
+    """Build a canonical signed Nostr event without third-party dependencies."""
+    pubkey = public_key_hex(private_key)
+    timestamp = int(time.time()) if created_at is None else int(created_at)
+    serialized = json.dumps(
+        [0, pubkey, timestamp, int(kind), tags, content],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    event_id = hashlib.sha256(serialized).digest()
+    return {
+        "id": event_id.hex(),
+        "pubkey": pubkey,
+        "created_at": timestamp,
+        "kind": int(kind),
+        "tags": tags,
+        "content": content,
+        "sig": schnorr_sign(
+            event_id,
+            private_key,
+            auxiliary_randomness=auxiliary_randomness,
+        ).hex(),
+    }
+
+
+def _validate_conditions(conditions: str) -> list[tuple[str, int]]:
+    parsed: list[tuple[str, int]] = []
+    if not conditions:
+        return parsed
+    if any(char.isspace() for char in conditions):
+        raise ValueError("NIP-OA conditions must not contain whitespace")
+    for clause in conditions.split("&"):
+        if clause.startswith("kind="):
+            value, maximum = clause[5:], 65_535
+        elif clause.startswith("created_at<") or clause.startswith("created_at>"):
+            value, maximum = clause[11:], 4_294_967_295
+        else:
+            raise ValueError("unsupported NIP-OA condition")
+        if (
+            not value.isascii()
+            or not value.isdecimal()
+            or (len(value) > 1 and value[0] == "0")
+        ):
+            raise ValueError("NIP-OA condition must use canonical decimal")
+        if int(value) > maximum:
+            raise ValueError("NIP-OA condition is out of range")
+        parsed.append((clause[: len(clause) - len(value)], int(value)))
+    return parsed
+
+
+def verify_auth_tag(auth_tag: list[str], agent_pubkey: str) -> str:
+    """Validate NIP-OA grammar/signature and return its owner pubkey."""
+    if (
+        not isinstance(auth_tag, list)
+        or len(auth_tag) != 4
+        or not all(isinstance(value, str) for value in auth_tag)
+    ):
+        raise ValueError("BUZZ_AUTH_TAG must be a four-string auth tag")
+    label, owner, conditions, signature = auth_tag
+    if (
+        label != "auth"
+        or not _strict_lower_hex(owner, 64)
+        or not _strict_lower_hex(agent_pubkey, 64)
+    ):
+        raise ValueError("BUZZ_AUTH_TAG contains an invalid label or pubkey")
+    if owner == agent_pubkey:
+        raise ValueError("NIP-OA self-attestation is invalid")
+    _validate_conditions(conditions)
+    message = hashlib.sha256(
+        f"nostr:agent-auth:{agent_pubkey}:{conditions}".encode()
+    ).digest()
+    if not schnorr_verify(message, owner, signature):
+        raise ValueError("BUZZ_AUTH_TAG signature verification failed")
+    return owner
+
+
+def verify_auth_tag_for_event(
+    auth_tag: list[str], agent_pubkey: str, *, kind: int, created_at: int
+) -> str:
+    """Validate a NIP-OA tag and every condition against one exact event."""
+    owner = verify_auth_tag(auth_tag, agent_pubkey)
+    for operator, value in _validate_conditions(auth_tag[2]):
+        if operator == "kind=" and int(kind) != value:
+            raise ValueError("NIP-OA kind condition is not satisfied")
+        if operator == "created_at<" and int(created_at) >= value:
+            raise ValueError("NIP-OA created_at condition is not satisfied")
+        if operator == "created_at>" and int(created_at) <= value:
+            raise ValueError("NIP-OA created_at condition is not satisfied")
+    return owner
+
+
 def build_auth_event(
     *,
     private_key: str,
@@ -355,6 +499,7 @@ def build_auth_event(
     created_at: Optional[int] = None,
     auxiliary_randomness: Optional[bytes] = None,
 ) -> dict[str, Any]:
+    timestamp = int(time.time()) if created_at is None else int(created_at)
     tags: list[list[str]] = [
         ["relay", relay_url],
         ["challenge", challenge],
@@ -371,10 +516,15 @@ def build_auth_event(
             or not all(isinstance(part, str) for part in auth_tag)
         ):
             raise ValueError("BUZZ_AUTH_TAG must be a four-string auth tag")
+        verify_auth_tag_for_event(
+            auth_tag,
+            public_key_hex(private_key),
+            kind=22242,
+            created_at=timestamp,
+        )
         tags.append(auth_tag)
 
     pubkey = public_key_hex(private_key)
-    timestamp = int(time.time()) if created_at is None else int(created_at)
     serialized = json.dumps(
         [0, pubkey, timestamp, 22242, tags, ""],
         separators=(",", ":"),

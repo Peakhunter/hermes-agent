@@ -2836,10 +2836,7 @@ class TestBuzzPluginRegistration:
         ctx.register_tool.assert_called_once()
         kwargs = ctx.register_tool.call_args.kwargs
         assert kwargs["name"] == "buzz_read_message_link"
-        assert kwargs["toolset"] == "hermes-buzz"
-        from hermes_cli.tools_config import _get_platform_tools
-
-        assert kwargs["toolset"] in _get_platform_tools({}, "buzz")
+        assert kwargs["toolset"] == "buzz"
         assert kwargs["is_async"] is True
         assert kwargs["requires_env"] == ["BUZZ_RELAY_URL", "BUZZ_PRIVATE_KEY"]
 

@@ -3212,7 +3212,7 @@ def register(ctx):
     settings = _load_settings()
     ctx.register_tool(
         name="buzz_read_message_link",
-        toolset="hermes-buzz",
+        toolset="buzz",
         schema=_BUZZ_READ_MESSAGE_LINK_SCHEMA,
         handler=_handle_buzz_read_message_link,
         check_fn=_check_buzz_link_reader,

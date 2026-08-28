@@ -2824,6 +2824,292 @@ class TestBuzzPluginRegistration:
         assert "MEDIA:/absolute/path" in platform_hint
         assert "do not use Computer Use" in platform_hint
         assert "document" not in platform_hint.lower()
+        assert "buzz://message" in platform_hint
+        assert "buzz_read_message_link" in platform_hint
+        assert "before making claims" in platform_hint
+
+    def test_registers_standard_message_link_reader(self):
+        ctx = MagicMock()
+
+        register(ctx)
+
+        ctx.register_tool.assert_called_once()
+        kwargs = ctx.register_tool.call_args.kwargs
+        assert kwargs["name"] == "buzz_read_message_link"
+        assert kwargs["toolset"] == "hermes-buzz"
+        from hermes_cli.tools_config import _get_platform_tools
+
+        assert kwargs["toolset"] in _get_platform_tools({}, "buzz")
+        assert kwargs["is_async"] is True
+        assert kwargs["requires_env"] == ["BUZZ_RELAY_URL", "BUZZ_PRIVATE_KEY"]
+
+
+class TestBuzzMessageLinkReader:
+    LINK = (
+        "buzz://message?"
+        f"channel={CHANNEL}&"
+        f"id={'1' * 64}&"
+        f"thread={'2' * 64}"
+    )
+
+    def test_parses_canonical_message_link(self):
+        assert _buzz_mod._parse_buzz_message_link(self.LINK) == {
+            "channel": CHANNEL,
+            "id": "1" * 64,
+            "thread": "2" * 64,
+        }
+
+    @pytest.mark.parametrize(
+        "link",
+        [
+            "https://example.com/message?channel=x&id=y",
+            "buzz://channel?channel=ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd&id=" + "1" * 64,
+            "buzz://message?channel=not-a-uuid&id=" + "1" * 64,
+            f"buzz://message?channel={CHANNEL}&id=ABC",
+            f"buzz://message?channel={CHANNEL}&id={'1' * 64}&thread=bad",
+            f"buzz://message?channel={CHANNEL}&id={'1' * 64}&thread=",
+            f"buzz://message?channel={CHANNEL}&id={'1' * 64}&extra=1",
+        ],
+    )
+    def test_rejects_noncanonical_or_malformed_links(self, link):
+        with pytest.raises(ValueError):
+            _buzz_mod._parse_buzz_message_link(link)
+
+    @pytest.mark.asyncio
+    async def test_reads_exact_link_with_configured_secret_kept_out_of_argv(
+        self, monkeypatch, tmp_path
+    ):
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://relay.example")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1secret")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+        target = {
+            "id": "1" * 64,
+            "pubkey": "3" * 64,
+            "content": "linked report",
+            "created_at": 1234,
+            "kind": 9,
+            "tags": [["e", "2" * 64, "", "root"]],
+        }
+        captured = {}
+
+        async def fake_exec(
+            cli_path,
+            args,
+            *,
+            relay_url,
+            private_key,
+            input_text=None,
+            timeout=30.0,
+        ):
+            captured.update(
+                cli_path=cli_path,
+                args=list(args),
+                relay_url=relay_url,
+                private_key=private_key,
+            )
+            return 0, json.dumps([target]), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+
+        raw = await _buzz_mod._handle_buzz_read_message_link({"link": self.LINK})
+        result = json.loads(raw)
+
+        assert result == {
+            "channel": CHANNEL,
+            "id": "1" * 64,
+            "thread": "2" * 64,
+            "pubkey": "3" * 64,
+            "created_at": 1234,
+            "content": "linked report",
+        }
+        assert captured["args"] == [
+            "messages",
+            "get",
+            "--channel",
+            CHANNEL,
+            "--limit",
+            "500",
+        ]
+        assert captured["relay_url"] == "https://relay.example"
+        assert captured["private_key"] == "nsec1secret"
+        assert all("nsec1secret" not in str(arg) for arg in captured["args"])
+        assert "nsec1secret" not in raw
+
+    @pytest.mark.asyncio
+    async def test_cli_failure_never_returns_secret_bearing_stderr(
+        self, monkeypatch, tmp_path
+    ):
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://relay.example")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1secret")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+
+        async def fake_exec(*args, **kwargs):
+            return 2, "", '{"error":"auth","message":"rejected nsec1secret"}'
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+
+        raw = await _buzz_mod._handle_buzz_read_message_link({"link": self.LINK})
+
+        assert json.loads(raw) == {"error": "Buzz CLI failed (exit 2)"}
+        assert "nsec1secret" not in raw
+        assert "rejected" not in raw
+
+    @pytest.mark.asyncio
+    async def test_reads_relay_and_cli_from_standard_yaml_config(
+        self, monkeypatch, tmp_path
+    ):
+        import hermes_cli.config as config_mod
+
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1secret")
+        monkeypatch.setattr(
+            config_mod,
+            "load_config",
+            lambda: {
+                "gateway": {
+                    "platforms": {
+                        "buzz": {
+                            "enabled": True,
+                            "extra": {
+                                "relay_url": "https://yaml-relay.example",
+                                "cli_path": str(fake_cli),
+                            },
+                        }
+                    }
+                }
+            },
+        )
+        captured = {}
+
+        async def fake_exec(
+            cli_path,
+            args,
+            *,
+            relay_url,
+            private_key,
+            input_text=None,
+            timeout=30.0,
+        ):
+            captured.update(cli_path=cli_path, relay_url=relay_url)
+            return 0, json.dumps(
+                [
+                    {
+                        "id": "1" * 64,
+                        "content": "yaml configured",
+                        "created_at": 1234,
+                        "kind": 9,
+                        "tags": [["e", "2" * 64, "", "root"]],
+                    }
+                ]
+            ), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+
+        result = json.loads(
+            await _buzz_mod._handle_buzz_read_message_link({"link": self.LINK})
+        )
+
+        assert result["content"] == "yaml configured"
+        assert captured == {
+            "cli_path": str(fake_cli),
+            "relay_url": "https://yaml-relay.example",
+        }
+
+    @pytest.mark.asyncio
+    async def test_paginates_until_exact_event_is_found(
+        self, monkeypatch, tmp_path
+    ):
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://relay.example")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1secret")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+        calls = []
+        first_page = [
+            {
+                "id": f"{index:064x}",
+                "content": "newer",
+                "created_at": 1000 - index,
+                "kind": 9,
+                "tags": [],
+            }
+            for index in range(500)
+        ]
+        target = {
+            "id": "1" * 64,
+            "content": "older exact event",
+            "created_at": 499,
+            "kind": 9,
+            "tags": [["e", "2" * 64, "", "root"]],
+        }
+
+        async def fake_exec(
+            cli_path,
+            args,
+            *,
+            relay_url,
+            private_key,
+            input_text=None,
+            timeout=30.0,
+        ):
+            calls.append(list(args))
+            page = first_page if "--before" not in args else [target]
+            return 0, json.dumps(page), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+
+        result = json.loads(
+            await _buzz_mod._handle_buzz_read_message_link({"link": self.LINK})
+        )
+
+        assert result["id"] == "1" * 64
+        assert result["content"] == "older exact event"
+        assert calls == [
+            ["messages", "get", "--channel", CHANNEL, "--limit", "500"],
+            [
+                "messages",
+                "get",
+                "--channel",
+                CHANNEL,
+                "--limit",
+                "500",
+                "--before",
+                "501",
+            ],
+        ]
+
+    @pytest.mark.asyncio
+    async def test_fails_closed_when_event_is_not_in_linked_thread(
+        self, monkeypatch, tmp_path
+    ):
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://relay.example")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1secret")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+        event = {
+            "id": "1" * 64,
+            "content": "wrong thread",
+            "created_at": 1234,
+            "kind": 9,
+            "tags": [["e", "4" * 64, "", "root"]],
+        }
+
+        async def fake_exec(*args, **kwargs):
+            return 0, json.dumps([event]), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+
+        result = json.loads(
+            await _buzz_mod._handle_buzz_read_message_link({"link": self.LINK})
+        )
+
+        assert result["error"] == "linked event does not belong to the requested thread"
 
 
 class TestStandaloneSend:

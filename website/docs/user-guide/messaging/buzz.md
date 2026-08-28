@@ -4,6 +4,8 @@ The Buzz adapter connects Hermes to a [Buzz](https://github.com/block/buzz) comm
 
 Buzz renders markdown, so agent replies keep their formatting. Images are delivered as native uploads (local files) or links (URLs). Replies use the stable NIP-10 thread root: a response to a root message opens one thread, and responses to nested replies stay attached to that original root instead of creating deeper subthreads. Recent event-to-root relationships are rebuilt from history after a gateway restart.
 
+Canonical `buzz://message?...` links are direct message sources. The bundled Buzz plugin registers `buzz_read_message_link`, which parses the channel, event, and optional thread identifiers; reads the exact event with the configured Buzz identity; and returns its content without putting the private key in command arguments or tool output. Buzz sessions are instructed to use this tool before making claims about a linked message or its accessibility.
+
 Inbound messages arrive over a persistent NIP-42-authenticated Nostr WebSocket subscription by default (near-instant delivery), with CLI polling as a startup fallback when `auto` cannot establish the WebSocket. An established WebSocket reconnects with bounded backoff if it disconnects; it does not switch to polling mid-connection. Outbound messages always go through the `buzz` CLI. Control inbound transport with `transport` / `BUZZ_TRANSPORT`: `auto` (default), `websocket` (require WS at startup), or `poll`. If your relay membership uses NIP-OA owner attestation, set `BUZZ_AUTH_TAG` to the four-string auth tag JSON.
 
 > Run `hermes gateway setup` and pick **Buzz** for a guided walk-through.

@@ -54,7 +54,7 @@ from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -2691,6 +2691,182 @@ class BuzzAdapter(BasePlatformAdapter):
         return _handle_gateway_turn_lifecycle(event=event, route=self)
 
 
+def _configured_buzz_extra() -> dict:
+    """Return the active Buzz platform's normal YAML ``extra`` mapping."""
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+    except Exception:
+        return {}
+    platform = (
+        ((config.get("gateway") or {}).get("platforms") or {}).get("buzz") or {}
+    )
+    if not isinstance(platform, dict) or platform.get("enabled") is False:
+        return {}
+    extra = platform.get("extra") or {}
+    return extra if isinstance(extra, dict) else {}
+
+
+def _buzz_link_reader_connection() -> Tuple[str, str, Optional[str]]:
+    """Resolve relay, CLI, and secret with env-over-YAML platform precedence."""
+    extra = _configured_buzz_extra()
+    relay = (os.getenv("BUZZ_RELAY_URL") or extra.get("relay_url") or "").strip()
+    cli_path = _resolve_cli_path(
+        os.getenv("BUZZ_CLI_PATH") or str(extra.get("cli_path") or "")
+    )
+    return relay, cli_path, _resolve_private_key(extra)
+
+
+def _check_buzz_link_reader() -> bool:
+    relay, cli_path, private_key = _buzz_link_reader_connection()
+    return bool(relay and cli_path and private_key)
+
+
+def _parse_buzz_message_link(link: str) -> Dict[str, str]:
+    """Parse one canonical ``buzz://message`` deep link fail closed."""
+    parsed = urlsplit(str(link or "").strip())
+    if (
+        parsed.scheme != "buzz"
+        or parsed.netloc != "message"
+        or parsed.path not in ("", "/")
+        or parsed.fragment
+    ):
+        raise ValueError("expected a canonical buzz://message link")
+    try:
+        query = parse_qs(
+            parsed.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+        )
+    except ValueError as exc:
+        raise ValueError("malformed Buzz message link query") from exc
+    if not set(query).issubset({"channel", "id", "thread"}):
+        raise ValueError("unsupported Buzz message link parameter")
+    if any(len(values) != 1 for values in query.values()):
+        raise ValueError("duplicate Buzz message link parameter")
+    channel = (query.get("channel") or [""])[0]
+    event_id = (query.get("id") or [""])[0]
+    thread = (query.get("thread") or [""])[0]
+    if not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        channel,
+    ):
+        raise ValueError("invalid Buzz channel id")
+    if not re.fullmatch(r"[0-9a-f]{64}", event_id):
+        raise ValueError("invalid Buzz event id")
+    if "thread" in query and not re.fullmatch(r"[0-9a-f]{64}", thread):
+        raise ValueError("invalid Buzz thread id")
+    result = {"channel": channel, "id": event_id}
+    if thread:
+        result["thread"] = thread
+    return result
+
+
+_BUZZ_READ_MESSAGE_LINK_SCHEMA = {
+    "name": "buzz_read_message_link",
+    "description": (
+        "Read the exact Buzz message referenced by a canonical "
+        "buzz://message link using the configured Buzz identity."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "link": {
+                "type": "string",
+                "description": "Canonical buzz://message link supplied by the user",
+            }
+        },
+        "required": ["link"],
+        "additionalProperties": False,
+    },
+}
+
+
+async def _handle_buzz_read_message_link(args: dict, **_kwargs) -> str:
+    """Resolve one Buzz deep link without exposing credential material."""
+    try:
+        link = _parse_buzz_message_link(args.get("link", ""))
+    except (AttributeError, ValueError) as exc:
+        return json.dumps({"error": str(exc)})
+    relay, cli_path, private_key = _buzz_link_reader_connection()
+    if not relay or not private_key:
+        return json.dumps({"error": "Buzz is not configured"})
+    if not cli_path:
+        return json.dumps({"error": "buzz CLI binary not found"})
+    event = None
+    before: Optional[int] = None
+    for _page in range(20):
+        command = [
+            "messages",
+            "get",
+            "--channel",
+            link["channel"],
+            "--limit",
+            "500",
+        ]
+        if before is not None:
+            command.extend(["--before", str(before)])
+        code, out, _err = await _exec_buzz(
+            cli_path,
+            command,
+            relay_url=relay,
+            private_key=private_key,
+        )
+        if code != 0:
+            return json.dumps({"error": f"Buzz CLI failed (exit {code})"})
+        try:
+            rows = json.loads(out)
+        except (TypeError, ValueError):
+            rows = None
+        if not isinstance(rows, list):
+            return json.dumps({"error": "buzz messages get returned malformed data"})
+        event = next(
+            (
+                row
+                for row in rows
+                if isinstance(row, dict) and row.get("id") == link["id"]
+            ),
+            None,
+        )
+        if event is not None or len(rows) < 500:
+            break
+        timestamps: List[int] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            created_at = row.get("created_at")
+            if isinstance(created_at, int) and not isinstance(created_at, bool):
+                timestamps.append(created_at)
+        if not timestamps:
+            return json.dumps(
+                {"error": "buzz messages get returned malformed pagination data"}
+            )
+        next_before = min(timestamps)
+        if before is not None and next_before >= before:
+            return json.dumps({"error": "buzz message pagination did not advance"})
+        before = next_before
+    if event is None:
+        return json.dumps({"error": "linked Buzz message was not found"})
+    thread = link.get("thread", "")
+    event_root = buzz_event_thread_root(event) or ""
+    if thread and event["id"] != thread and event_root != thread:
+        return json.dumps(
+            {"error": "linked event does not belong to the requested thread"}
+        )
+    return json.dumps(
+        {
+            "channel": link["channel"],
+            "id": event["id"],
+            "thread": thread or event_root or None,
+            "pubkey": event.get("pubkey"),
+            "created_at": event.get("created_at"),
+            "content": event.get("content", ""),
+        },
+        ensure_ascii=False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Plugin registration
 # ---------------------------------------------------------------------------
@@ -3034,6 +3210,17 @@ def _handle_gateway_turn_lifecycle(*, event, route=None, **_kwargs):
 def register(ctx):
     """Plugin entry point: called by the Hermes plugin system."""
     settings = _load_settings()
+    ctx.register_tool(
+        name="buzz_read_message_link",
+        toolset="hermes-buzz",
+        schema=_BUZZ_READ_MESSAGE_LINK_SCHEMA,
+        handler=_handle_buzz_read_message_link,
+        check_fn=_check_buzz_link_reader,
+        requires_env=["BUZZ_RELAY_URL", "BUZZ_PRIVATE_KEY"],
+        is_async=True,
+        description=_BUZZ_READ_MESSAGE_LINK_SCHEMA["description"],
+        emoji="🐝",
+    )
     ctx.register_platform(
         name="buzz",
         label="Buzz",
@@ -3076,6 +3263,9 @@ def register(ctx):
             "reach you without a mention. Keep responses conversational. "
             "You can send local images natively. When the user supplies the path "
             "to an existing local image, respond with MEDIA:/absolute/path to that "
-            "image directly; do not use Computer Use or open a UI."
+            "image directly; do not use Computer Use or open a UI. When a user "
+            "supplies a buzz://message link, treat it as a direct source and call "
+            "buzz_read_message_link before making claims about its contents or "
+            "accessibility; never request, print, or reconstruct a private key."
         ),
     )

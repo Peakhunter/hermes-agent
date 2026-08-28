@@ -662,6 +662,9 @@ def test_registration_drives_live_central_authorization_in_transport_profile(
     captured = {}
 
     class Context:
+        def register_tool(self, **kwargs):
+            pass
+
         def register_platform(self, **kwargs):
             captured.update(kwargs)
 
@@ -758,6 +761,9 @@ def test_global_allow_all_does_not_override_explicit_buzz_allowlist(
     captured = {}
 
     class Context:
+        def register_tool(self, **kwargs):
+            pass
+
         def register_platform(self, **kwargs):
             captured.update(kwargs)
 

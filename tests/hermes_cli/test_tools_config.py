@@ -1219,27 +1219,3 @@ def test_explicit_plugin_toolset_admitted_against_real_a2a_plugin(monkeypatch):
         f"plugin-provided 'a2a' toolset dropped by _get_platform_tools "
         f"(Layer 2 of #81163); enabled={sorted(enabled)}"
     )
-
-
-def test_plugin_platform_tool_preserves_core_toolsets():
-    """A tool in the platform-name toolset joins the generated composite
-    without displacing the normal core capabilities."""
-    from tools.registry import registry
-    from toolsets import resolve_toolset
-
-    name = "buzz_read_message_link_contract_probe"
-    registry.register(
-        name=name,
-        toolset="buzz",
-        schema={"type": "object", "properties": {}},
-        handler=lambda **_kwargs: "",
-    )
-    try:
-        enabled = _get_platform_tools({}, "buzz")
-        composite = resolve_toolset("hermes-buzz")
-
-        assert name in composite
-        assert "terminal" in enabled
-        assert "file" in enabled
-    finally:
-        registry.deregister(name)

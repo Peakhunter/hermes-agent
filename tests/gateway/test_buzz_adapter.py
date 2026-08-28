@@ -2840,6 +2840,49 @@ class TestBuzzPluginRegistration:
         assert kwargs["is_async"] is True
         assert kwargs["requires_env"] == ["BUZZ_RELAY_URL", "BUZZ_PRIVATE_KEY"]
 
+    def test_real_registration_preserves_core_tools_with_link_reader(self):
+        """Drive the adapter's real registration seam, not a synthetic probe."""
+        from dataclasses import fields
+
+        from gateway.platform_registry import PlatformEntry, platform_registry
+        from hermes_cli.tools_config import _get_platform_tools
+        from tools.registry import registry
+        from toolsets import resolve_toolset
+
+        tool_name = "buzz_read_message_link"
+        previous_tool = registry.snapshot_registration(tool_name)
+        previous_platform = platform_registry.get("buzz")
+
+        class RealRegistrationContext:
+            def register_tool(self, **kwargs):
+                registry.register(**kwargs, override=True)
+
+            def register_platform(self, **kwargs):
+                accepted = {field.name for field in fields(PlatformEntry)}
+                entry = PlatformEntry(
+                    **{key: value for key, value in kwargs.items() if key in accepted}
+                )
+                platform_registry.register(entry)
+
+        try:
+            register(RealRegistrationContext())
+
+            composite = resolve_toolset("hermes-buzz")
+            enabled = _get_platform_tools({}, "buzz")
+
+            assert tool_name in composite
+            assert "terminal" in enabled
+            assert "file" in enabled
+            assert "read_file" in composite
+            assert "write_file" in composite
+        finally:
+            current_tool = registry.snapshot_registration(tool_name)
+            if current_tool is not None:
+                registry.restore_registration(tool_name, current_tool, previous_tool)
+            platform_registry.unregister("buzz")
+            if previous_platform is not None:
+                platform_registry.register(previous_platform)
+
 
 class TestBuzzMessageLinkReader:
     LINK = (

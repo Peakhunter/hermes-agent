@@ -195,7 +195,9 @@ class TestLaunchdRestartWedgedIntegration:
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 180.0)
         monkeypatch.setattr("gateway.status.get_running_pid", lambda *a, **k: 4242)
         monkeypatch.setattr(
-            gateway_cli, "_request_gateway_self_restart", lambda pid: False
+            gateway_cli,
+            "_request_gateway_self_restart",
+            lambda pid: events.append("self-restart") or False,
         )
         monkeypatch.setattr(
             gateway_cli,
@@ -226,7 +228,66 @@ class TestLaunchdRestartWedgedIntegration:
         monkeypatch.setattr(
             gateway_cli, "_clear_launchd_unsupported_marker", lambda: None
         )
+        monkeypatch.setattr(
+            gateway_cli, "_launchd_unsupported_marker_exists", lambda: False
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_rewrite_launchd_plist_if_needed",
+            lambda: events.append("rewrite") or False,
+        )
         return events
+
+    def test_stale_service_definition_uses_verified_detached_reload(
+        self, monkeypatch, tmp_path
+    ):
+        events = self._setup(monkeypatch, gateway_cli.GATEWAY_LOOP_ALIVE)
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("stale", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "refresh_launchd_plist_if_needed",
+            lambda: events.append("detached-reload") or True,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_service_pid",
+            lambda *a, **k: events.append("verified") or True,
+        )
+
+        gateway_cli.launchd_restart()
+
+        assert events == ["detached-reload", "verified"]
+        assert "self-restart" not in events
+
+    def test_stale_detached_fallback_is_stopped_and_restarted(
+        self, monkeypatch, tmp_path
+    ):
+        events = self._setup(monkeypatch, gateway_cli.GATEWAY_LOOP_ALIVE)
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("stale", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli, "_launchd_unsupported_marker_exists", lambda: True
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_rewrite_launchd_plist_if_needed", lambda: True
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_fallback_to_detached",
+            lambda reason: events.append(("fallback", reason)),
+        )
+
+        gateway_cli.launchd_restart()
+
+        assert "sigterm" in events
+        assert ("drain", 180.0) in events
+        assert "self-restart" not in events
+        assert any(event[0] == "fallback" for event in events if isinstance(event, tuple))
 
     def test_wedged_gateway_skips_drain_and_escalates(self, monkeypatch):
         events = self._setup(monkeypatch, gateway_cli.GATEWAY_LOOP_WEDGED)

@@ -188,8 +188,13 @@ class TestEscalateWedgedGateway:
 class TestLaunchdRestartWedgedIntegration:
     """launchd_restart must skip the 180s drain only for a wedged loop."""
 
-    def _setup(self, monkeypatch, liveness):
+    def _setup(self, monkeypatch, liveness, tmp_path):
         events = []
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_launchd_plist_path",
+            lambda: tmp_path / "missing-launchd.plist",
+        )
         monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
         monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 180.0)
@@ -241,7 +246,7 @@ class TestLaunchdRestartWedgedIntegration:
     def test_stale_service_definition_uses_verified_detached_reload(
         self, monkeypatch, tmp_path
     ):
-        events = self._setup(monkeypatch, gateway_cli.GATEWAY_LOOP_ALIVE)
+        events = self._setup(monkeypatch, gateway_cli.GATEWAY_LOOP_ALIVE, tmp_path)
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("stale", encoding="utf-8")
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
@@ -265,7 +270,7 @@ class TestLaunchdRestartWedgedIntegration:
     def test_stale_detached_fallback_is_stopped_and_restarted(
         self, monkeypatch, tmp_path
     ):
-        events = self._setup(monkeypatch, gateway_cli.GATEWAY_LOOP_ALIVE)
+        events = self._setup(monkeypatch, gateway_cli.GATEWAY_LOOP_ALIVE, tmp_path)
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("stale", encoding="utf-8")
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
@@ -289,24 +294,26 @@ class TestLaunchdRestartWedgedIntegration:
         assert "self-restart" not in events
         assert any(event[0] == "fallback" for event in events if isinstance(event, tuple))
 
-    def test_wedged_gateway_skips_drain_and_escalates(self, monkeypatch):
-        events = self._setup(monkeypatch, gateway_cli.GATEWAY_LOOP_WEDGED)
+    def test_wedged_gateway_skips_drain_and_escalates(self, monkeypatch, tmp_path):
+        events = self._setup(
+            monkeypatch, gateway_cli.GATEWAY_LOOP_WEDGED, tmp_path
+        )
         gateway_cli.launchd_restart()
         assert "escalate" in events
         # The 180s drain wait must never run for a wedged loop.
         assert not any(isinstance(e, tuple) and e[0] == "drain" for e in events)
 
-    def test_busy_gateway_keeps_full_drain_budget(self, monkeypatch):
+    def test_busy_gateway_keeps_full_drain_budget(self, monkeypatch, tmp_path):
         """A busy-but-alive gateway (fresh heartbeat) must NOT be escalated —
         that would bypass the in-flight cron drain floor (#86684)."""
-        events = self._setup(monkeypatch, gateway_cli.GATEWAY_LOOP_ALIVE)
+        events = self._setup(monkeypatch, gateway_cli.GATEWAY_LOOP_ALIVE, tmp_path)
         gateway_cli.launchd_restart()
         assert "escalate" not in events
         assert ("drain", 180.0) in events
 
-    def test_unknown_liveness_keeps_full_drain_budget(self, monkeypatch):
+    def test_unknown_liveness_keeps_full_drain_budget(self, monkeypatch, tmp_path):
         """Ambiguity (no heartbeat) must never trigger escalation."""
-        events = self._setup(monkeypatch, gateway_cli.GATEWAY_LOOP_UNKNOWN)
+        events = self._setup(monkeypatch, gateway_cli.GATEWAY_LOOP_UNKNOWN, tmp_path)
         gateway_cli.launchd_restart()
         assert "escalate" not in events
         assert ("drain", 180.0) in events

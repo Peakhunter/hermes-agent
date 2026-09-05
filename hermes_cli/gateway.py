@@ -4927,13 +4927,8 @@ def launchd_plist_is_current() -> bool:
     ) == _normalize_launchd_plist_for_comparison(expected)
 
 
-def refresh_launchd_plist_if_needed() -> bool:
-    """Rewrite the installed launchd plist when the generated definition has changed.
-
-    Unlike systemd, launchd picks up plist changes on the next ``launchctl kill``/
-    ``launchctl kickstart`` cycle — no daemon-reload is needed. We still bootout/
-    bootstrap to make launchd re-read the updated plist immediately.
-    """
+def _rewrite_launchd_plist_if_needed() -> bool:
+    """Rewrite a stale installed plist without changing launchd state."""
     plist_path = get_launchd_plist_path()
     if not plist_path.exists() or launchd_plist_is_current():
         return False
@@ -4943,6 +4938,20 @@ def refresh_launchd_plist_if_needed() -> bool:
         return False
 
     plist_path.write_text(new_plist, encoding="utf-8")
+    return True
+
+
+def refresh_launchd_plist_if_needed() -> bool:
+    """Rewrite the installed launchd plist when the generated definition has changed.
+
+    Unlike systemd, launchd picks up plist changes on the next ``launchctl kill``/
+    ``launchctl kickstart`` cycle — no daemon-reload is needed. We still bootout/
+    bootstrap to make launchd re-read the updated plist immediately.
+    """
+    if not _rewrite_launchd_plist_if_needed():
+        return False
+
+    plist_path = get_launchd_plist_path()
     label = get_launchd_label()
     domain = _launchd_domain()
     target = f"{domain}/{label}"
@@ -5374,14 +5383,40 @@ def _wait_for_launchd_service_pid(
 
 
 def launchd_restart():
+    plist_path = get_launchd_plist_path()
+    plist_was_stale = plist_path.exists() and not launchd_plist_is_current()
     label = get_launchd_label()
-    target = f"{_launchd_domain()}/{label}"
+    domain = _launchd_domain()
+    target = f"{domain}/{label}"
     drain_timeout = _get_restart_drain_timeout()
     from gateway.status import get_running_pid
 
+    detached_stale_restart = plist_was_stale and _launchd_unsupported_marker_exists()
+    if plist_was_stale and not detached_stale_restart:
+        old_pid = get_running_pid()
+        if not refresh_launchd_plist_if_needed():
+            raise RuntimeError("Refusing to restart with a stale launchd service definition")
+        if not _wait_for_launchd_service_pid(
+            label,
+            old_pid=old_pid,
+            timeout=(2 * drain_timeout) + LAUNCHD_SUPERVISION_VERIFY_TIMEOUT + 10.0,
+            domain=domain,
+        ):
+            _launchd_fallback_to_detached(
+                "updated launchd service failed supervision verification"
+            )
+        else:
+            print("✓ Service definition updated and service restarted")
+            _clear_launchd_unsupported_marker()
+        return
+
+    plist_rewritten = _rewrite_launchd_plist_if_needed()
+    if plist_was_stale and not plist_rewritten:
+        raise RuntimeError("Refusing to restart with a stale launchd service definition")
+
     try:
         pid = get_running_pid()
-        if pid is not None and _request_gateway_self_restart(pid):
+        if pid is not None and not plist_rewritten and _request_gateway_self_restart(pid):
             print("✓ Service restart requested")
             _clear_launchd_unsupported_marker()
             return
@@ -5420,7 +5455,12 @@ def launchd_restart():
                     print(
                         f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart"
                     )
-        subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
+        if detached_stale_restart:
+            _launchd_fallback_to_detached("refreshing detached fallback service")
+            return
+        subprocess.run(
+            ["launchctl", "kickstart", "-k", target], check=True, timeout=90
+        )
         print("✓ Service restarted")
         _clear_launchd_unsupported_marker()
     except subprocess.CalledProcessError as e:

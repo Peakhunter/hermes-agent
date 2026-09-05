@@ -3442,6 +3442,145 @@ def _abandon_timed_out_gateway_turn(
     return True
 
 
+class _SuspendAwareInactivityWindow:
+    """Measure active-runtime idle time without counting system suspension."""
+
+    def __init__(
+        self,
+        *,
+        wall_time: Optional[float] = None,
+        monotonic_time: Optional[float] = None,
+        suspend_tolerance: float = 5.0,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._previous_wall = time.time() if wall_time is None else float(wall_time)
+        self._previous_monotonic = (
+            time.monotonic() if monotonic_time is None else float(monotonic_time)
+        )
+        self._suspend_tolerance = max(0.0, float(suspend_tolerance))
+        self._resumed_wall: Optional[float] = None
+        self._resumed_monotonic: Optional[float] = None
+        self._suspension_gap_seconds = 0.0
+
+    def observe(
+        self,
+        *,
+        wall_time: Optional[float] = None,
+        monotonic_time: Optional[float] = None,
+    ) -> float:
+        """Record one poll and return a newly observed suspension gap, if any."""
+        wall = time.time() if wall_time is None else float(wall_time)
+        monotonic = time.monotonic() if monotonic_time is None else float(monotonic_time)
+        with self._lock:
+            wall_elapsed = max(0.0, wall - self._previous_wall)
+            monotonic_elapsed = max(0.0, monotonic - self._previous_monotonic)
+            suspend_gap = max(0.0, wall_elapsed - monotonic_elapsed)
+            self._previous_wall = wall
+            self._previous_monotonic = monotonic
+            if suspend_gap <= self._suspend_tolerance:
+                return 0.0
+            self._suspension_gap_seconds += suspend_gap
+            self._resumed_wall = wall
+            self._resumed_monotonic = monotonic
+            return suspend_gap
+
+    def observe_activity(self, *, last_activity_at: Optional[float]) -> None:
+        """Clear sleep attribution once real activity occurs after wake."""
+        if last_activity_at is None:
+            return
+        try:
+            activity_at = float(last_activity_at)
+        except (TypeError, ValueError):
+            return
+        with self._lock:
+            if self._resumed_wall is None or activity_at < self._resumed_wall:
+                return
+            self._resumed_wall = None
+            self._resumed_monotonic = None
+            self._suspension_gap_seconds = 0.0
+
+    def effective_idle_seconds(
+        self,
+        measured_idle_seconds: float,
+        *,
+        monotonic_time: Optional[float] = None,
+    ) -> float:
+        """Return idle time bounded by active runtime elapsed since wake."""
+        monotonic = time.monotonic() if monotonic_time is None else float(monotonic_time)
+        with self._lock:
+            idle = max(0.0, float(measured_idle_seconds))
+            if self._resumed_monotonic is None:
+                return idle
+            return min(idle, max(0.0, monotonic - self._resumed_monotonic))
+
+    @property
+    def suspension_gap_seconds(self) -> float:
+        with self._lock:
+            return self._suspension_gap_seconds
+
+
+def _format_inactivity_duration(seconds: float) -> str:
+    total_minutes = max(1, int(max(0.0, float(seconds)) // 60))
+    hours, minutes = divmod(total_minutes, 60)
+    if hours and minutes:
+        return f"{hours}h {minutes}m"
+    if hours:
+        return f"{hours}h"
+    return f"{minutes} min"
+
+
+def _build_gateway_inactivity_timeout_message(
+    activity: dict,
+    *,
+    timeout: float,
+    suspension_gap_seconds: float = 0.0,
+    active_idle_seconds: Optional[float] = None,
+) -> str:
+    """Build diagnostics that distinguish measured idle from the configured limit."""
+    measured_idle = max(0.0, float(activity.get("seconds_since_activity", 0.0)))
+    last_desc = activity.get("last_activity_desc", "unknown")
+    current_tool = activity.get("current_tool")
+    iteration = activity.get("api_call_count", 0)
+    max_iterations = activity.get("max_iterations", 0)
+    limit_text = _format_inactivity_duration(timeout)
+    measured_text = _format_inactivity_duration(measured_idle)
+
+    if suspension_gap_seconds > 0:
+        active_idle = timeout if active_idle_seconds is None else active_idle_seconds
+        lines = [
+            f"⏱️ Agent request interrupted after "
+            f"{_format_inactivity_duration(active_idle)} of active-runtime inactivity "
+            "following system sleep or hibernation.",
+            f"Measured wall-clock inactivity was {measured_text}; approximately "
+            f"{_format_inactivity_duration(suspension_gap_seconds)} occurred while "
+            "the system was suspended.",
+        ]
+    else:
+        lines = [
+            f"⏱️ Agent showed no activity for {measured_text} "
+            f"({limit_text} inactivity limit)."
+        ]
+
+    if current_tool:
+        lines.append(
+            f"The agent appears stuck on tool `{current_tool}` "
+            f"(iteration {iteration}/{max_iterations})."
+        )
+    else:
+        lines.append(
+            f"Last activity: {last_desc} (iteration {iteration}/{max_iterations}). "
+            "The in-flight API request or operation did not resume."
+        )
+
+    if suspension_gap_seconds <= 0:
+        lines.append(
+            "To increase the limit, set agent.gateway_timeout in config.yaml "
+            "(value in seconds, 0 = no limit) and restart the gateway."
+        )
+    lines.append("Try again, or use /reset to start fresh.")
+    return "\n".join(lines)
+
+
 def _watch_gateway_turn_inactivity(
     *,
     agent_holder,
@@ -3453,18 +3592,34 @@ def _watch_gateway_turn_inactivity(
     cleanup_lock: threading.Lock,
     poll_interval: float = 5.0,
     is_still_current: Optional[Callable[[], bool]] = None,
+    inactivity_window: Optional[_SuspendAwareInactivityWindow] = None,
 ) -> None:
     """Thread watchdog that remains runnable when gateway asyncio is starved."""
+    inactivity_window = inactivity_window or _SuspendAwareInactivityWindow()
     while not worker_done.wait(max(0.01, poll_interval)):
+        suspend_gap = inactivity_window.observe()
+        if suspend_gap:
+            logger.info(
+                "Gateway turn %s resumed after a %.0fs system suspension; "
+                "resetting the active-runtime inactivity window",
+                task_id,
+                suspend_gap,
+            )
         agent = agent_holder[0] if agent_holder else None
         if agent is None or not hasattr(agent, "get_activity_summary"):
             continue
         try:
-            idle_seconds = float(
-                agent.get_activity_summary().get("seconds_since_activity", 0.0)
+            activity = agent.get_activity_summary()
+            measured_idle_seconds = float(activity.get("seconds_since_activity", 0.0))
+            inactivity_window.observe_activity(
+                last_activity_at=(
+                    activity.get("last_activity_at")
+                    or activity.get("last_activity_ts")
+                )
             )
         except Exception:
             continue
+        idle_seconds = inactivity_window.effective_idle_seconds(measured_idle_seconds)
         if idle_seconds < timeout:
             continue
         _abandon_timed_out_gateway_turn(
@@ -29307,6 +29462,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _turn_worker_done = threading.Event()
             _turn_timeout_fired = threading.Event()
             _turn_cleanup_lock = threading.Lock()
+            _turn_inactivity_window = _SuspendAwareInactivityWindow()
             # task_id above is session-scoped, not turn-scoped (#76115
             # review): gate the eventual reap on this exact claim still
             # being current, so a replacement turn that starts on the same
@@ -29353,6 +29509,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "cleanup_lock": _turn_cleanup_lock,
                         "poll_interval": 5.0,
                         "is_still_current": _turn_is_current,
+                        "inactivity_window": _turn_inactivity_window,
                     },
                     name=f"gateway-turn-watchdog-{_turn_task_id[:12]}",
                     daemon=True,
@@ -29411,6 +29568,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 _stts.abort("barge-in")
 
             else:
+                assert _agent_timeout is not None
                 # Poll loop: check the agent's built-in activity tracker
                 # (updated by _touch_activity() on every tool call, API
                 # call, and stream delta) every few seconds.
@@ -29419,6 +29577,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     done, _ = await asyncio.wait(
                         {_executor_task}, timeout=_POLL_INTERVAL
                     )
+                    _turn_inactivity_window.observe()
                     if done:
                         # Prefer the real result when the worker finished,
                         # even if the watchdog fired in the same window: the
@@ -29439,11 +29598,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         try:
                             _act = _agent_ref.get_activity_summary()
                             _idle_secs = _act.get("seconds_since_activity", 0.0)
+                            _turn_inactivity_window.observe_activity(
+                                last_activity_at=(
+                                    _act.get("last_activity_at")
+                                    or _act.get("last_activity_ts")
+                                )
+                            )
                         except Exception:
                             pass
+                    _effective_idle_secs = _turn_inactivity_window.effective_idle_seconds(
+                        _idle_secs
+                    )
                     # Staged warning: fire once before escalating to full timeout.
                     if (not _warning_fired and _agent_warning is not None
-                            and _idle_secs >= _agent_warning):
+                            and _effective_idle_secs >= _agent_warning):
                         _warning_fired = True
                         _warn_adapter = self._adapter_for_source(source)
                         if _warn_adapter:
@@ -29460,7 +29628,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 )
                             except Exception as _warn_err:
                                 logger.debug("Inactivity warning send error: %s", _warn_err)
-                    if _idle_secs >= _agent_timeout:
+                    if _effective_idle_secs >= _agent_timeout:
                         _inactivity_timeout = True
                         threading.Thread(
                             target=_abandon_timed_out_gateway_turn,
@@ -29541,33 +29709,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _timed_out_agent:
                     request_hard_interrupt(_timed_out_agent, _INTERRUPT_REASON_TIMEOUT)
 
-                _timeout_mins = int(_agent_timeout // 60) or 1
-
-                # Construct a user-facing message with diagnostic context.
-                _diag_lines = [
-                    f"⏱️ Agent inactive for {_timeout_mins} min — no tool calls "
-                    f"or API responses."
-                ]
-                if _cur_tool:
-                    _diag_lines.append(
-                        f"The agent appears stuck on tool `{_cur_tool}` "
-                        f"({_secs_ago:.0f}s since last activity, "
-                        f"iteration {_iter_n}/{_iter_max})."
-                    )
-                else:
-                    _diag_lines.append(
-                        f"Last activity: {_last_desc} ({_secs_ago:.0f}s ago, "
-                        f"iteration {_iter_n}/{_iter_max}). "
-                        "The agent may have been waiting on an API response."
-                    )
-                _diag_lines.append(
-                    "To increase the limit, set agent.gateway_timeout in config.yaml "
-                    "(value in seconds, 0 = no limit) and restart the gateway.\n"
-                    "Try again, or use /reset to start fresh."
+                _timeout_message = _build_gateway_inactivity_timeout_message(
+                    _activity,
+                    timeout=_agent_timeout,
+                    suspension_gap_seconds=(
+                        _turn_inactivity_window.suspension_gap_seconds
+                    ),
+                    active_idle_seconds=_turn_inactivity_window.effective_idle_seconds(
+                        _secs_ago
+                    ),
                 )
 
                 response = {
-                    "final_response": "\n".join(_diag_lines),
+                    "final_response": _timeout_message,
                     "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                     "api_calls": _iter_n,
                     "tools": tools_holder[0] or [],

@@ -15,6 +15,10 @@ import sys
 import time
 from pathlib import Path
 
+from gateway.run import (
+    _SuspendAwareInactivityWindow,
+    _build_gateway_inactivity_timeout_message,
+)
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -165,6 +169,63 @@ class TestStagedInactivityWarning:
         pool.shutdown(wait=False, cancel_futures=True)
         assert _warning_fired
         assert _inactivity_timeout
+
+
+class TestSleepAwareTimeoutDiagnostics:
+    def test_suspend_gap_resets_active_runtime_inactivity(self):
+        window = _SuspendAwareInactivityWindow(wall_time=100.0, monotonic_time=50.0)
+
+        assert window.observe(wall_time=31190.0, monotonic_time=52.0) == 31088.0
+        assert window.effective_idle_seconds(31090.0, monotonic_time=52.0) == 0.0
+        assert window.effective_idle_seconds(31210.0, monotonic_time=72.0) == 20.0
+
+    def test_normal_scheduler_delay_is_not_system_suspension(self):
+        window = _SuspendAwareInactivityWindow(wall_time=100.0, monotonic_time=50.0)
+
+        assert window.observe(wall_time=110.0, monotonic_time=60.0) == 0.0
+        assert window.effective_idle_seconds(10.0, monotonic_time=60.0) == 10.0
+
+    def test_activity_after_wake_clears_suspension_attribution(self):
+        window = _SuspendAwareInactivityWindow(wall_time=100.0, monotonic_time=50.0)
+        window.observe(wall_time=31190.0, monotonic_time=52.0)
+
+        window.observe_activity(last_activity_at=31191.0)
+
+        assert window.suspension_gap_seconds == 0.0
+        assert window.effective_idle_seconds(1800.0, monotonic_time=1852.0) == 1800.0
+
+    def test_timeout_message_reports_measured_idle_not_threshold(self):
+        message = _build_gateway_inactivity_timeout_message(
+            {
+                "last_activity_desc": "starting API call #10",
+                "seconds_since_activity": 31088.0,
+                "api_call_count": 10,
+                "max_iterations": 90,
+            },
+            timeout=1800.0,
+        )
+
+        assert "8h 38m" in message
+        assert "30 min inactivity limit" in message
+        assert "Agent inactive for 30 min" not in message
+
+    def test_sleep_recovery_does_not_recommend_raising_timeout(self):
+        message = _build_gateway_inactivity_timeout_message(
+            {
+                "last_activity_desc": "starting API call #10",
+                "seconds_since_activity": 32888.0,
+                "api_call_count": 10,
+                "max_iterations": 90,
+            },
+            timeout=1800.0,
+            suspension_gap_seconds=31088.0,
+            active_idle_seconds=1800.0,
+        )
+
+        assert "system sleep or hibernation" in message
+        assert "interrupted" in message
+        assert "increase the limit" not in message
+        assert "gateway_timeout" not in message
 
 
 

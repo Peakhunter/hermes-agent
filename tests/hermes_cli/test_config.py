@@ -1639,12 +1639,12 @@ class TestDelegationCapUnificationMigration:
 
 
 class TestBackgroundNotificationsConciseMigration:
-    """v34 → v35: move users on the old implicit default 'all' to 'concise'."""
+    """New implicit defaults must not overwrite a persisted supported choice."""
 
     def _write(self, tmp_path, body):
         (tmp_path / "config.yaml").write_text(body, encoding="utf-8")
 
-    def test_all_becomes_concise(self, tmp_path):
+    def test_explicit_all_is_preserved(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             self._write(
                 tmp_path,
@@ -1654,7 +1654,7 @@ class TestBackgroundNotificationsConciseMigration:
             )
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
-        assert raw["display"]["background_process_notifications"] == "concise"
+        assert raw["display"]["background_process_notifications"] == "all"
 
     def test_explicit_choices_preserved(self, tmp_path):
         # NOTE: bare `off` in YAML parses as boolean False — the gateway mode

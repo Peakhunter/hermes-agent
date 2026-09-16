@@ -96,6 +96,9 @@ class MessageEvent:
         if not self.is_command():
             return None
         raw = (self.text or "").lstrip().split(maxsplit=1)[0][1:].lower().split("@", 1)[0]
+        # Command pickers append a Unicode ellipsis to commands needing input.
+        # Normalize only that suffix; arguments and internal punctuation stay literal.
+        raw = raw.rstrip("…")
         # Reject file paths: valid command names never contain /
         return None if "/" in raw else raw
 

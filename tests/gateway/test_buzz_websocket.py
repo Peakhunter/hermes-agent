@@ -39,6 +39,11 @@ def _make_adapter(extra=None):
     adapter._self_pubkey = SELF_PUBKEY
     adapter._private_key = TEST_PRIVATE_KEY
     adapter._display_name = "Chip"
+    # These legacy transport-only sockets bypass AUTH and omit recv/ACK support.
+    # The directory release tests use matched identities and real signed EVENTs;
+    # isolate that new stage here without changing any transport assertions.
+    from unittest.mock import AsyncMock
+    adapter._publish_directory_websocket = AsyncMock(return_value=True)
     return adapter
 
 

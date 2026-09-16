@@ -214,7 +214,9 @@ def _maybe_nudge_update() -> None:
     threading.Thread(target=_run, name="cua-driver-update-check", daemon=True).start()
 
 
-class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
+from tools.computer_use.cua_backend_browser import BrowserMixin
+
+class CuaDriverBackend(_CaptureMixin, _InputMixin, BrowserMixin, ComputerUseBackend):
     """Default computer-use backend. Cross-platform via cua-driver MCP."""
 
     def __init__(self, permission_mode: str = "standard") -> None:
@@ -244,6 +246,9 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
     def _handle_transport_reset(self) -> None:
         """Invalidate every capability minted by the replaced transport."""
         self._clear_active_target()
+        route = getattr(self, "_typed_browser", None)
+        if route is not None:
+            route.state.clear()
 
     def start(self) -> None:
         contract = cua_driver_runtime_contract_status()

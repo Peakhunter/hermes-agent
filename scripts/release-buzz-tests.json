@@ -1,0 +1,163 @@
+{
+  "backend": [
+    "tests/gateway/test_buzz_routing_release.py",
+    "tests/gateway/test_buzz_routing_continuations_release.py",
+    "tests/gateway/test_buzz_adapter.py",
+    "tests/gateway/test_buzz_identity_lifecycle.py",
+    "tests/gateway/test_buzz_handoff_release.py",
+    "tests/gateway/test_buzz_command_menu_release.py",
+    "tests/gateway/test_buzz_directory_release.py",
+    "tests/gateway/test_buzz_membership_release.py",
+    "tests/gateway/test_buzz_authz.py",
+    "tests/gateway/test_buzz_websocket.py",
+    "tests/gateway/test_buzz_mention_resolution.py",
+    "tests/gateway/test_buzz_progress_thread_routing.py",
+    "tests/gateway/test_buzz_thread_topology.py",
+    "tests/gateway/test_buzz_forum_kinds.py",
+    "tests/plugins/platforms/buzz/test_buzz_unscoped_requirement_gate.py",
+    "tests/gateway/test_busy_session_auth_bypass.py",
+    "tests/gateway/test_clarify_active_session_bypass.py",
+    "tests/gateway/test_stream_consumer_thread_routing.py",
+    "tests/gateway/test_post_stream_media_delivery.py",
+    "tests/gateway/test_73771_media_resend_dedup.py",
+    "tests/gateway/test_background_process_notifications.py",
+    "tests/gateway/test_internal_notification_marker_82888.py",
+    "tests/gateway/test_buzz_authorization_before_side_effects.py",
+    "tests/gateway/test_buzz_authorization_await.py",
+    "tests/gateway/test_live_thread_policy.py",
+    "tests/gateway/test_buzz_mention_settings.py",
+    "tests/gateway/test_buzz_pending_controls.py",
+    "tests/gateway/test_buzz_legacy_thread_policy.py",
+    "tests/gateway/test_buzz_message_link_reader.py",
+    "tests/gateway/test_live_buzz_authorization.py",
+    "tests/release_buzz/test_installed_contract.py",
+    "tests/release_buzz/test_matrix.py",
+    "tests/release_buzz/test_owner_probes.py",
+    "tests/release_buzz/test_reviewer_edges.py",
+    "tests/hermes_cli/test_buzz_config_policy.py",
+    "tests/gateway/test_buzz_config_live_save.py",
+    "tests/gateway/test_buzz_startup_allowlist.py",
+    "tests/hermes_cli/test_buzz_config_host.py",
+    "tests/gateway/test_buzz_activity_release.py",
+    "tests/gateway/test_buzz_activity_bridge_release.py",
+    "tests/gateway/test_buzz_lifecycle_release.py",
+    "tests/gateway/test_buzz_activity_completion_release.py"
+  ],
+  "frontend": [
+    "src/pages/ConfigPage.plugin-sections.test.tsx",
+    "src/plugins/management-profile.test.ts",
+    "src/plugins/buzz-policy.test.tsx",
+    "src/plugins/registry.test.ts",
+    "src/plugins/usePlugins.test.ts",
+    "src/lib/api.test.ts",
+    "src/plugins/characterization.lifecycle.test.tsx",
+    "src/pages/ConfigPage.lifecycle.test.tsx",
+    "src/plugins/lifecycle.controls.test.tsx",
+    "src/pages/PluginsPage.discoverability.test.tsx"
+  ],
+  "upstream_seams": [
+    "tests/gateway/test_completion_admission.py",
+    "tests/gateway/test_async_delegation_session_binding.py",
+    "tests/gateway/test_resume_command.py",
+    "tests/tools/test_async_delegation.py",
+    "tests/gateway/test_telegram_group_gating.py",
+    "tests/gateway/test_gateway_command_dispatch_minimal.py",
+    "tests/gateway/test_command_bypass_active_session.py",
+    "tests/gateway/test_plugin_message_injection.py",
+    "tests/gateway/test_display_null_turn_wiring.py",
+    "tests/gateway/test_failure_writer_ownership.py",
+    "tests/gateway/test_heartbeat_execution_ownership.py",
+    "tests/gateway/test_heartbeat_acceptance.py",
+    "tests/agent/test_bot_profile_prompt_isolation.py",
+    "tests/gateway/test_bot_loop_guard.py",
+    "tests/hermes_cli/test_plugin_catalog.py",
+    "tests/hermes_cli/test_web_plugins_catalog.py",
+    "tests/scripts/test_validate_plugin_catalog.py"
+  ],
+  "carryovers": [
+    {
+      "source": "/home/hermes/.local/share/reinhold-recovery/hermes-audit-20260908/candidate-config-host-evidence/test_installed_contract.py",
+      "destination": "tests/release_buzz/test_installed_contract.py",
+      "sha256": "3fd07d966b9820628af37d028d49d1d2a82aeeeb9795d1b7722aeef11c7012ea"
+    },
+    {
+      "source": "/home/hermes/.local/share/reinhold-recovery/hermes-audit-20260908/candidate-config-host-evidence/test_matrix.py",
+      "destination": "tests/release_buzz/test_matrix.py",
+      "sha256": "536d1326f9ec52a1aca57649eb4092c8550389a0131af6a66afcda73af38d65f"
+    },
+    {
+      "source": "/home/hermes/.local/share/reinhold-recovery/hermes-audit-20260908/candidate-config-host-evidence/test_owner_probes.py",
+      "destination": "tests/release_buzz/test_owner_probes.py",
+      "sha256": "8510e90190f55096a5d0fcf6d7548455655d4ef36bb16bac9d51c9a8362ab49a"
+    },
+    {
+      "source": "/home/hermes/.local/share/reinhold-recovery/hermes-audit-20260908/candidate-config-host-evidence/test_reviewer_edges.py",
+      "destination": "tests/release_buzz/test_reviewer_edges.py",
+      "sha256": "436f52da490307d939f26ea0da15a972e8ace7e1d363e00dd4f59df1c7fd37ca"
+    }
+  ],
+  "directory_membership_fixture_reconciliation": {
+    "file": "tests/gateway/test_buzz_websocket.py",
+    "helper": "_make_adapter",
+    "reason": "Inherited transport-only fake sockets bypass AUTH, use a mismatched private key/profile identity, and omit recv/ACK. Isolate the added publication stage with AsyncMock; all inherited test assertions remain byte/AST-identical. Real signing, identity mismatch, owner validation, matching ACK, timeout, reconnect and deferred frames run in test_buzz_directory_release.py.",
+    "original_failures_evidence": "directory-membership/inherited-r1 and aggregate-r1"
+  },
+  "baseline_reconciliation": [
+    {
+      "original": "TestInboundAttachments::test_unauthorized_sender_attachment_is_not_downloaded",
+      "replacement": "TestInboundAttachments::test_central_attachment_authority_overrides_local_snapshot",
+      "reason": "Old fixture explicitly granted central True but expected a local snapshot to prevent all authorization/download. Installed contract makes central authority sole sender gate. Paired False/True run real callback, parser/cache, base/runner; deny suppresses download/profile/reaction/reply, True downloads and returns real /whoami despite opposite local snapshot.",
+      "controls": [
+        "TestInboundAttachments::test_non_true_gateway_authority_never_caches_even_for_locally_allowed_sender"
+      ]
+    },
+    {
+      "original": "TestMentionGating::test_require_mention_false_still_dispatches_unaddressed_message",
+      "replacement": "TestMentionGating::test_live_owner_mention_policy_changes_without_adapter_reconstruction",
+      "reason": "Setting a stale startup attribute does not change live owner policy. Atomic owner true/false/true config updates control next ordinary message on the same adapter even under conflicting routed home. Explicit mentions are positive controls at each transition."
+    },
+    {
+      "original": "TestMentionGating::test_allowlist_blocks_unauthorized",
+      "replacement": "TestMentionGating::test_central_live_authority_not_local_allowlist_controls_intake",
+      "reason": "Adapter-local snapshots no longer own sender access. Opposite local grants and exclusions must not override actual central deny/allow/deny. All events reach real runner; denials suppress protected I/O and reply while allowed /whoami returns actual identity response."
+    },
+    {
+      "original": "TestMentionGating::test_unknown_sender_tag_gets_no_reaction",
+      "replacement": "TestMentionGating::test_unknown_sender_tag_reaches_only_central_denial_or_authorized_command",
+      "reason": "Unknown sender must still reach central denial/pairing rather than be dropped by local allowlist. Real group denial emits no profile/reaction/reply; paired central grant returns real /whoami and seen for that same unknown-to-local-lists principal. No pairing invitation is claimed for this group test."
+    },
+    {
+      "original": "TestNip10ThreadReplyMentionGate::test_thread_reply_to_own_message_dispatches_without_mention",
+      "replacement": "TestNip10ThreadReplyMentionGate::test_ordinary_reply_to_self_obeys_independent_thread_policy",
+      "reason": "Installed ordinary reply-to-self is not a blanket mention bypass. Both asymmetric channel/thread policies preserve independent ordinary thread admission and reply identity; explicit mention remains positive control. Exact pending controls are separately tested through real base/runner/pending wait.",
+      "controls": [
+        "tests/gateway/test_buzz_pending_controls.py::test_approve_session_resolves_real_wait_no_echo",
+        "tests/gateway/test_buzz_pending_controls.py::test_deny_resolves_real_wait_no_echo",
+        "tests/gateway/test_buzz_pending_controls.py::test_unauthorized_sender_cannot_resolve",
+        "tests/gateway/test_buzz_pending_controls.py::test_ordinary_and_unrelated_slash_reply_stays_mention_gated"
+      ]
+    }
+  ],
+  "compatibility": [
+    "tests/hermes_cli/test_config.py",
+    "tests/hermes_cli/test_installed_explicit_config_preservation.py",
+    "tests/tools/test_computer_use.py",
+    "tests/tools/test_computer_use_approval_isolation.py",
+    "tests/tools/test_computer_use_capture_routing.py",
+    "tests/tools/test_computer_use_cua_0_10_permissions.py",
+    "tests/tools/test_computer_use_cua_0_9.py",
+    "tests/tools/test_computer_use_cua_backend_linux.py",
+    "tests/tools/test_computer_use_cua_macos_identity.py",
+    "tests/tools/test_computer_use_delivery_ladder.py",
+    "tests/tools/test_computer_use_display_count_guard.py",
+    "tests/tools/test_computer_use_empty_discovery_diagnosis.py",
+    "tests/tools/test_computer_use_fullscreen_capture.py",
+    "tests/tools/test_computer_use_input_target_guard.py",
+    "tests/tools/test_computer_use_null_pid_windows.py",
+    "tests/tools/test_computer_use_placeholder_ids.py",
+    "tests/tools/test_computer_use_vision_routing.py",
+    "tests/tools/test_computer_use_zero_bounds.py",
+    "tests/tools/test_installed_browser_compatibility.py",
+    "tests/tools/test_installed_browser_launch_grant.py"
+  ]
+}

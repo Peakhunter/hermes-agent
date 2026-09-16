@@ -221,6 +221,7 @@ class _CuaDriverSession:
         # Phase marker surfaced by the ready-timeout error (issue #57025): when startup wedges, the caller
         # reports HOW FAR it got instead of an opaque "never reached ready".
         self._startup_phase = "binary-check"
+        private_socket_dir = None
         try:
             driver_cmd = _driver.resolve_cua_driver_cmd()
             if not driver_cmd:
@@ -230,6 +231,14 @@ class _CuaDriverSession:
             (command, args), child_env = (
                 (daemon.proxy_invocation(), daemon.child_env()) if daemon is not None
                 else (_driver._resolve_mcp_invocation(driver_cmd), _cb.cua_driver_child_env()))
+            if daemon is None and _cb._computer_use_cfg().get("grant_existing_profile") is True:
+                import sys
+                args = [*args, "--grant", "existing-profile"]
+                if sys.platform == "darwin":
+                    import tempfile
+                    private_socket_dir = tempfile.TemporaryDirectory(prefix="hermes-cua-standard-")
+                    self._owned_standard_runtime_socket = os.path.join(private_socket_dir.name, "driver.sock")
+                    args += ["--socket", self._owned_standard_runtime_socket]
             _t_manifest = _time.monotonic()
             # Telemetry policy first (default: disabled), then strip Hermes secrets.
             params = StdioServerParameters(command=command, args=args, env=_sanitize_subprocess_env(child_env))
@@ -255,6 +264,9 @@ class _CuaDriverSession:
             # A session that dies for ANY reason must be re-enterable: the next call sees _started False and
             # rebuilds. Atomic bool write — stop() may hold _lock.
             self._session, self._started = None, False
+            if private_socket_dir is not None:
+                self._owned_standard_runtime_socket = None
+                private_socket_dir.cleanup()
 
     # Reset _started so a session that dies for ANY reason (MCP connection drop, driver crash, unexpected
     # coro exit) is re-enterable: the next start()/call sees _started False and rebuilds the session instead
@@ -457,6 +469,8 @@ class _CuaDriverSession:
         if daemon is not None:
             driver_command, child_env = daemon.proxy_invocation()[0], daemon.child_env()
             socket_args = ["--socket", daemon.socket_path]
+        elif getattr(self, "_owned_standard_runtime_socket", None):
+            socket_args = ["--socket", self._owned_standard_runtime_socket]
         cmd = [driver_command, "call", name, json.dumps(call_args), *socket_args]
         try:
             return _cli_result(_cli_run_json(cmd, _sanitize_subprocess_env(child_env), name, timeout), shot_file)

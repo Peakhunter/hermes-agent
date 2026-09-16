@@ -54,7 +54,7 @@ def _canon_key_combo(keys: str) -> frozenset:
 
 def _reject_unsafe(action: str, args: Dict[str, Any]) -> Optional[str]:
     """JSON error for hard-blocked input, else None. Runs BEFORE the approval prompt."""
-    if action == "type" and (pat := next((p.pattern for p in _BLOCKED_TYPE_PATTERNS if p.search(args.get("text", ""))), None)):
+    if action in {"type", "cua_browser_type"} and (pat := next((p.pattern for p in _BLOCKED_TYPE_PATTERNS if p.search(args.get("text", ""))), None)):
         return json.dumps({"error": f"blocked pattern in type text: {pat!r}",
                            "hint": "Dangerous shell patterns cannot be typed via computer_use."})
     if action == "key" and (blocked := next((b for b in _BLOCKED_KEY_COMBOS
@@ -277,6 +277,11 @@ def _request_approval(action: str, args: Dict[str, Any], session_id: str = "") -
     user explicitly opted into unattended operation. State is keyed on session_id so concurrent runs don't
     leak unlocks into one another. See #67052.
     """
+    if action == "cua_browser_prepare" and args.get("profile_mode") == "existing_profile":
+        from tools.computer_use.cua_backend import _computer_use_cfg
+        with contextlib.suppress(Exception):
+            if _computer_use_cfg().get("grant_existing_profile") is True:
+                return None
     scope_key = (action, "foreground" if args.get("delivery_mode") == "foreground" else "background")
     with _approval_lock:
         if _session_auto_approve.get(session_id) or scope_key in _always_allow.get(session_id, set()):
@@ -378,6 +383,16 @@ _ACTIONS: Dict[str, _ActionSpec] = {
     "list_apps": _ActionSpec(partial(_do_listing, key="apps")),
     "list_windows": _ActionSpec(partial(_do_listing, key="windows")),
 }
+from tools.computer_use.browser_dispatch import dispatch_browser
+
+_BROWSER_ACTIONS = frozenset({
+    "cua_browser_state", "cua_browser_prepare", "cua_browser_navigate",
+    "cua_browser_click", "cua_browser_type", "cua_browser_pointer",
+    "cua_browser_dialog", "cua_browser_set_input_files", "cua_browser_download",
+})
+_ACTIONS.update({action: _ActionSpec(dispatch_browser, destructive=action != "cua_browser_state")
+                 for action in _BROWSER_ACTIONS})
+
 # Native input actions deliver to the backend's sticky target; `app=` is NOT a targeting parameter (guard in _dispatch).
 _INPUT_ACTIONS = frozenset(a for a, s in _ACTIONS.items() if s.input)
 

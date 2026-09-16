@@ -587,8 +587,27 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
         extra_guard=lambda raw: raw.get("verify_on_stop") is True)),
     (33, _migrate_to_33),
     (34, _migrate_to_34),
-    # 35/36: new defaults apply only to absent keys. Persisted all/50 remain
-    # supported choices; equality to an old default does not prove provenance.
+    # 34 → 35: background_process_notifications 'all' (old implicit default, rarely chosen on
+    # purpose) → 'concise'. Explicit result/error/off choices are preserved.
+    (35, functools.partial(
+        _rewrite_key, section="display", key="background_process_notifications",
+        match=_lower_is("all"), new="concise",
+        added="display.background_process_notifications=concise (was: all)",
+        message=(
+            "  ✓ Background process notifications switched from 'all' to "
+            "'concise' — completions now show a one-line status message "
+            "instead of the raw output dump. Set "
+            "display.background_process_notifications: all to restore "
+            "the old behavior."))),
+    # 35 → 36: subagent iteration cap 50 → 250 (50 truncated substantial delegated work).
+    (36, _rewrite_stale_default(
+        section="delegation", key="max_iterations", old=50, new=250,
+        added="delegation.max_iterations=250 (was: 50)",
+        message=(
+            "  ✓ Raised delegation.max_iterations from 50 to 250 — subagents "
+            "now get a larger per-child tool-call budget so delegated work "
+            "finishes instead of truncating. Set delegation.max_iterations "
+            "back to 50 to restore the old cap."))),
     # 36 → 37: delegation concurrency 3 → 10 (stays at/below the high-cost warning threshold).
     (37, _rewrite_stale_default(
         section="delegation", key="max_concurrent_children", old=3, new=10,

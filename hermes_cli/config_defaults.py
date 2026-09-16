@@ -2227,8 +2227,6 @@ DEFAULT_CONFIG = {
     "paste_collapse_char_threshold": 2000,
 
     "computer_use": {
-        # Trusted launcher opt-in, never supplied by model arguments.
-        "grant_existing_profile": False,
         # cua-driver's upstream PostHog telemetry defaults ON; Hermes sets
         # CUA_DRIVER_RS_TELEMETRY_ENABLED=0 in every child env unless this is true.
         "cua_telemetry": False,

@@ -185,11 +185,6 @@ _PROPERTIES: Dict[str, Any] = {
     },
 }
 
-from tools.computer_use.browser_schema import BROWSER_ACTIONS, BROWSER_PROPERTIES
-
-_PROPERTIES.update(BROWSER_PROPERTIES)
-_PROPERTIES["action"]["enum"].extend(BROWSER_ACTIONS)
-
 COMPUTER_USE_SCHEMA: Dict[str, Any] = {
     "name": "computer_use",
     "description": (

@@ -15,7 +15,7 @@ def _strict_policy_env(path: Path) -> dict[str, str]:
     except (OSError, UnicodeDecodeError) as exc:
         raise PolicyEnvironmentError("environment_unavailable") from exc
 
-    from hermes_cli.config import _parse_env_value
+    from agent.secret_scope import _parse_env_value
 
     values: dict[str, str] = {}
     for raw in text.splitlines():

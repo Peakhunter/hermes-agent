@@ -20,7 +20,7 @@ def setup(monkeypatch, tmp_path):
     adapter = buzz.BuzzAdapter(PlatformConfig(enabled=True, extra={'relay_url':'https://test.invalid','transport':'poll'}))
     adapter.cli_path = '/synthetic/buzz'
     released = []
-    monkeypatch.setattr(status, 'release_scoped_lock', lambda scope,key: released.append((scope,key)))
+    monkeypatch.setattr(status, 'release_scoped_lock', lambda scope,key,metadata=None: released.append((scope,key)))
     adapter._load_cursors = lambda: None
     adapter._save_cursors = lambda: None
     adapter._discover_dms = AsyncMock()
@@ -34,14 +34,14 @@ def setup(monkeypatch, tmp_path):
 async def test_real_contract_false_tuple_prevents_post_lock_io(setup, monkeypatch):
     adapter,released=setup
     # Current status API returns tuple[bool, Optional[dict]], not bool.
-    monkeypatch.setattr(status, 'acquire_scoped_lock', lambda scope,key: (False, {'pid':123,'profile':'other'}))
+    monkeypatch.setattr(status, 'acquire_scoped_lock', lambda scope,key,metadata=None: (False, {'pid':123,'profile':'other'}))
     adapter._run_cli = AsyncMock(side_effect=[(0,json.dumps([{'pubkey':PUB}]),''),(0,json.dumps([{'channel_id':CHANNEL}]),'')])
     try:
         result = await adapter.connect()
-        print(json.dumps({'probe':'conflict','result':result,'post_lock_cli':adapter._run_cli.await_count-1,'directory_published':adapter._publish_directory_fallback.await_count,'lock_key_retained':bool(adapter._lock_key)}))
+        print(json.dumps({'probe':'conflict','result':result,'post_lock_cli':adapter._run_cli.await_count-1,'directory_published':adapter._publish_directory_fallback.await_count,'lock_key_retained':bool(adapter._platform_lock_identity)}))
         assert result is False, 'tuple(False, holder) must not be treated as a grant'
         assert adapter._run_cli.await_count == 1
-        assert adapter._lock_key is None
+        assert adapter._platform_lock_identity is None
         assert adapter._poll_task is None
         adapter._publish_directory_fallback.assert_not_awaited()
         adapter._discover_dms.assert_not_awaited()
@@ -53,7 +53,7 @@ async def test_real_contract_false_tuple_prevents_post_lock_io(setup, monkeypatc
 @pytest.mark.asyncio
 async def test_positive_acquisition_connects_and_explicit_disconnect_releases(setup, monkeypatch):
     adapter,released = setup
-    monkeypatch.setattr(status, 'acquire_scoped_lock', lambda scope,key: (True,None))
+    monkeypatch.setattr(status, 'acquire_scoped_lock', lambda scope,key,metadata=None: (True,None))
     adapter._run_cli = AsyncMock(side_effect=[(0,json.dumps([{'pubkey':PUB}]),''),(0,json.dumps([{'channel_id':CHANNEL}]),'')])
     try:
         assert await adapter.connect() is True
@@ -62,7 +62,7 @@ async def test_positive_acquisition_connects_and_explicit_disconnect_releases(se
     finally:
         await adapter.disconnect()
     assert released == [('buzz',f'https://test.invalid:{PUB}')]
-    assert adapter._lock_key is None
+    assert adapter._platform_lock_identity is None
     await adapter.disconnect()
     assert released == [('buzz',f'https://test.invalid:{PUB}')]
 
@@ -70,7 +70,7 @@ async def test_positive_acquisition_connects_and_explicit_disconnect_releases(se
 @pytest.mark.parametrize('failure',['return_false','exception','cancellation'])
 async def test_post_acquire_failure_releases_owned_lock(setup,monkeypatch,failure):
     adapter,released=setup
-    monkeypatch.setattr(status,'acquire_scoped_lock',lambda scope,key:(True,None))
+    monkeypatch.setattr(status,'acquire_scoped_lock',lambda scope,key,metadata=None:(True,None))
     async def cli(args, **kwargs):
         if args == ['users','get']:
             return 0,json.dumps([{'pubkey':PUB}]),''
@@ -86,9 +86,9 @@ async def test_post_acquire_failure_releases_owned_lock(setup,monkeypatch,failur
         else:
             with pytest.raises(RuntimeError if failure=='exception' else asyncio.CancelledError):
                 await adapter.connect()
-        print(json.dumps({'probe':failure,'release_count':len(released),'lock_key_retained':bool(adapter._lock_key)}))
+        print(json.dumps({'probe':failure,'release_count':len(released),'lock_key_retained':bool(adapter._platform_lock_identity)}))
         assert released == [('buzz', f'https://test.invalid:{PUB}')], 'failed connect must release its acquired lock'
-        assert adapter._lock_key is None
+        assert adapter._platform_lock_identity is None
     finally:
         await adapter.disconnect()
     assert released == [('buzz', f'https://test.invalid:{PUB}')]

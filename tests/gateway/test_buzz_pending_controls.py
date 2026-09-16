@@ -31,6 +31,8 @@ async def journey(tmp_path, monkeypatch, request):
     monkeypatch.setenv('HERMES_HOME', str(home))
     monkeypatch.setenv('GATEWAY_ALLOWED_USERS', USER)
     (home / 'config.yaml').write_text('buzz:\n  require_mention: true\n  thread_require_mention: true\napprovals:\n  timeout: 10\n')
+    # The primary profile's allowlist lives in its own .env; authorization runs inside that scope.
+    (home / '.env').write_text(f'GATEWAY_ALLOWED_USERS={USER}\n')
     config = GatewayConfig(sessions_dir=home / 'sessions')
     if getattr(request, 'param', None) == 'served-other':
         from gateway.profile_routing import parse_profile_routes

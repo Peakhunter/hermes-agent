@@ -780,6 +780,8 @@ class BuzzAdapter(BasePlatformAdapter):
         # Two profiles must not drive the same identity on one relay (duplicate replies, split de-dupe state).
         if not self._acquire_platform_lock(
                 "buzz", f"{self.relay_url}:{self._self_pubkey}", f"Buzz identity {self._self_pubkey[:8]}… on {self.relay_url}"):
+            # Nothing was acquired: the connect-failure disconnect must not release the holder's lock.
+            self._platform_lock_identity = None
             return False
         connected = False
         try:
